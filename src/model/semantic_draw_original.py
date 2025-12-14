@@ -19,8 +19,7 @@
 # SOFTWARE.
 
 from transformers import Blip2Processor, Blip2ForConditionalGeneration
-from diffusers import DiffusionPipeline, LCMScheduler, EulerDiscreteScheduler, AutoencoderTiny
-from huggingface_hub import hf_hub_download
+from diffusers import LCMScheduler, DDIMScheduler, AutoencoderTiny
 
 import torch
 import torch.nn as nn
@@ -28,16 +27,14 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from einops import rearrange
 
-import random
-from collections import deque
 from typing import Tuple, List, Literal, Optional, Union
+from tqdm import tqdm
 from PIL import Image
 
-from util import load_model, gaussian_lowpass, shift_to_mask_bbox_center
-from data import BackgroundObject, LayerObject, BackgroundState #, LayerState
+from util import load_model, gaussian_lowpass, blend, get_panorama_views, shift_to_mask_bbox_center
 
 
-class SemanticDraw(nn.Module):
+class SemanticDrawPipeline(nn.Module):
     def __init__(
         self,
         device: torch.device,
@@ -45,300 +42,229 @@ class SemanticDraw(nn.Module):
         sd_version: Literal['1.5'] = '1.5',
         hf_key: Optional[str] = None,
         lora_key: Optional[str] = None,
-        use_tiny_vae: bool = True,
-        t_index_list: List[int] = [0, 4, 12, 25, 37], # [0, 5, 16, 18, 20, 37], Magic number.
-        width: int = 512,
-        height: int = 512,
-        frame_buffer_size: int = 1,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 1.2,
-        delta: float = 1.0,
-        cfg_type: Literal['none', 'full', 'self', 'initialize'] = 'none',
-        seed: int = 2024,
-        seedfix: bool = False,
-        autoflush: bool = True,
-        default_mask_std: float = 8.0,
+        load_from_local: bool = False, # Turn on if you have already downloaed LoRA & Hugging Face hub is down.
+        default_mask_std: float = 1.0, # 8.0
         default_mask_strength: float = 1.0,
-        default_prompt_strength: float = 0.95,
-        bootstrap_steps: int = 1,
-        bootstrap_mix_steps: float = 1.0,
-        # bootstrap_leak_sensitivity: float = 0.2,
-        preprocess_mask_cover_alpha: float = 0.3, # TODO
-        prompt_queue_capacity: int = 256,
-        mask_type: Literal['discrete', 'semi-continuous', 'continuous'] = 'continuous',
-        use_xformers: bool = True,
+        default_prompt_strength: float = 1.0, # 8.0
+        default_bootstrap_steps: int = 1,
+        default_boostrap_mix_steps: float = 1.0,
+        default_bootstrap_leak_sensitivity: float = 0.2,
+        default_preprocess_mask_cover_alpha: float = 0.3,
+        t_index_list: List[int] = [0, 4, 12, 25, 37], # [0, 5, 16, 18, 20, 37], # [0, 12, 25, 37], # Magic number.
+        mask_type: Literal['discrete', 'semi-continuous', 'continuous'] = 'discrete',
+        has_i2t: bool = True,
     ) -> None:
+        r"""Stabilized regionally assigned texts-to-image generation for fast sampling.
+
+        Accelrated region-based text-to-image synthesis with Latent Consistency
+        Model while preserving mask fidelity and quality.
+
+        Args:
+            device (torch.device): Specify CUDA device.
+            dtype (torch.dtype): Default precision used in the sampling
+                process. By default, it is FP16.
+            sd_version (Literal['1.5', '2.0', '2.1', 'xl']): StableDiffusion
+                version. Currently, only 1.5 is supported.
+            hf_key (Optional[str]): Custom StableDiffusion checkpoint for
+                stylized generation.
+            lora_key (Optional[str]): Custom LCM LoRA for acceleration.
+            load_from_local (bool): Turn on if you have already downloaed LoRA 
+                & Hugging Face hub is down.
+            default_mask_std (float): Preprocess mask with Gaussian blur with
+                specified standard deviation.
+            default_mask_strength (float): Preprocess mask by multiplying it
+                globally with the specified variable. Caution: extremely
+                sensitive. Recommended range: 0.98-1.
+            default_prompt_strength (float): Preprocess foreground prompts
+                globally by linearly interpolating its embedding with the
+                background prompt embeddint with specified mix ratio. Useful
+                control handle for foreground blending. Recommended range:
+                0.5-1.
+            default_bootstrap_steps (int): Bootstrapping stage steps to
+                encourage region separation. Recommended range: 1-3.
+            default_boostrap_mix_steps (float): Bootstrapping background is a
+                linear interpolation between background latent and the white
+                image latent. This handle controls the mix ratio. Available
+                range: 0-(number of bootstrapping inference steps). For
+                example, 2.3 means that for the first two steps, white image
+                is used as a bootstrapping background and in the third step,
+                mixture of white (0.3) and registered background (0.7) is used
+                as a bootstrapping background.
+            default_bootstrap_leak_sensitivity (float): Postprocessing at each
+                inference step by masking away the remaining bootstrap
+                backgrounds t Recommended range: 0-1.
+            default_preprocess_mask_cover_alpha (float): Optional preprocessing
+                where each mask covered by other masks is reduced in its alpha
+                value by this specified factor.
+            t_index_list (List[int]): The default scheduling for the scheduler.
+            mask_type (Literal['discrete', 'semi-continuous', 'continuous']):
+                defines the mask quantization modes. Details in the codes of
+                `self.process_mask`. Basically, this (subtly) controls the
+                smoothness of foreground-background blending. More continuous
+                means more blending, but smaller generated patch depending on
+                the mask standard deviation.
+            has_i2t (bool): Automatic background image to text prompt con-
+                version with BLIP-2 model. May not be necessary for the non-
+                streaming application.
+        """
         super().__init__()
 
         self.device = device
         self.dtype = dtype
-        self.seed = seed
-        self.seedfix = seedfix
         self.sd_version = sd_version
 
-        self.autoflush = autoflush
         self.default_mask_std = default_mask_std
         self.default_mask_strength = default_mask_strength
         self.default_prompt_strength = default_prompt_strength
-        self.bootstrap_steps = (
-            bootstrap_steps > torch.arange(len(t_index_list))).to(dtype=self.dtype, device=self.device)
-        self.bootstrap_mix_steps = bootstrap_mix_steps
-        self.bootstrap_mix_ratios = (
-            bootstrap_mix_steps - torch.arange(len(t_index_list), dtype=self.dtype, device=self.device)).clip_(0, 1)
-        # self.bootstrap_leak_sensitivity = bootstrap_leak_sensitivity
-        self.preprocess_mask_cover_alpha = preprocess_mask_cover_alpha
+        self.default_t_list = t_index_list
+        self.default_bootstrap_steps = default_bootstrap_steps
+        self.default_boostrap_mix_steps = default_boostrap_mix_steps
+        self.default_bootstrap_leak_sensitivity = default_bootstrap_leak_sensitivity
+        self.default_preprocess_mask_cover_alpha = default_preprocess_mask_cover_alpha
         self.mask_type = mask_type
 
-        ### State definition
-
-        # [0. Start]                 -(prepare)->           [1. Initialized]
-        # [1. Initialized]           -(update_background)-> [2. Background Registered] (len(self.prompts)==0)
-        # [2. Background Registered] -(update_layers)->     [3. Unflushed] (len(self.prompts)>0)
-
-        # [3. Unflushed]             -(flush)->             [4. Ready]
-        # [4. Ready]                 -(any updates)->       [3. Unflushed]
-        # [4. Ready]                 -(__call__)->          [4. Ready], continuously returns generated image.
-
-        self.ready_checklist = {
-            'initialized': False,
-            'background_registered': False,
-            'layers_ready': False,
-            'flushed': False,
-        }
-
-        ### Session state update queue: for lazy update policy for streaming applications.
-
-        self.update_buffer = {
-            'background': None,                            # Maintains a single instance of BackgroundObject
-            'layers': deque(maxlen=prompt_queue_capacity), # Maintains a queue of LayerObjects
-        }
-
-        print(f'[INFO]     Loading Stable Diffusion...')
-        get_scheduler = lambda pipe: LCMScheduler.from_config(pipe.scheduler.config)
+        print(f'[INFO] Loading Stable Diffusion...')
         lora_weight_name = None
         if self.sd_version == '1.5':
             if hf_key is not None:
-                print(f'[INFO]     Using custom model key: {hf_key}')
+                print(f'[INFO] Using custom model key: {hf_key}')
                 model_key = hf_key
             else:
                 model_key = 'runwayml/stable-diffusion-v1-5'
             lora_key = 'latent-consistency/lcm-lora-sdv1-5'
             lora_weight_name = 'pytorch_lora_weights.safetensors'
-        # elif self.sd_version == 'xl':
-        #     model_key = 'stabilityai/stable-diffusion-xl-base-1.0'
-        #     lora_key = 'latent-consistency/lcm-lora-sdxl'
-        #     lora_weight_name = 'pytorch_lora_weights.safetensors'
         else:
             raise ValueError(f'Stable Diffusion version {self.sd_version} not supported.')
 
-        ### Internally stored "Session" states
-
-        self.state = {
-            'background': BackgroundState(), # Maintains a single instance of BackgroundState
-            # 'layers': LayerState(),          # Maintains a single instance of LayerState
-            'model_key': model_key,          # The Hugging Face model ID.
-        }
-
         # Create model
-        self.i2t_processor = Blip2Processor.from_pretrained('Salesforce/blip2-opt-2.7b')
-        self.i2t_model = Blip2ForConditionalGeneration.from_pretrained('Salesforce/blip2-opt-2.7b')
+        if has_i2t:
+            self.i2t_processor = Blip2Processor.from_pretrained('Salesforce/blip2-opt-2.7b')
+            self.i2t_model = Blip2ForConditionalGeneration.from_pretrained('Salesforce/blip2-opt-2.7b')
 
         self.pipe = load_model(model_key, self.sd_version, self.device, self.dtype)
+        if lora_key is None:
+            print(f'[INFO] LCM LoRA is not available for SD version {sd_version}. Using DDIM Scheduler instead...')
+            self.pipe.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+            self.scheduler = self.pipe.scheduler
+            self.default_num_inference_steps = 50
+            self.default_guidance_scale = 7.5
+        else:
+            self.pipe.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
+            self.scheduler = self.pipe.scheduler
+            self.pipe.load_lora_weights(lora_key, weight_name=lora_weight_name, adapter_name='lcm')
+            self.default_num_inference_steps = 4
+            self.default_guidance_scale = 1.0
 
-        self.pipe.load_lora_weights(lora_key, weight_name=lora_weight_name, adapter_name='lcm')
-        self.pipe.fuse_lora(
-            fuse_unet=True,
-            fuse_text_encoder=True,
-            lora_scale=1.0,
-            safe_fusing=False,
-        )
-        if use_xformers:
-            self.pipe.enable_xformers_memory_efficient_attention()
+            self.prepare_lcm_schedule(t_index_list, 50)
 
-        self.vae = (
-            AutoencoderTiny.from_pretrained('madebyollin/taesd').to(device=self.device, dtype=self.dtype)
-            if use_tiny_vae else self.pipe.vae
-        )
-        # self.tokenizer = self.pipe.tokenizer
+        self.vae = self.pipe.vae
+        self.tokenizer = self.pipe.tokenizer
         self.text_encoder = self.pipe.text_encoder
         self.unet = self.pipe.unet
         self.vae_scale_factor = self.pipe.vae_scale_factor
 
-        self.scheduler = get_scheduler(self.pipe)
+        # Prepare white background for bootstrapping.
+        self.get_white_background(768, 768)
+
+        print(f'[INFO] Model is loaded!')
+
+    def prepare_lcm_schedule(
+        self,
+        t_index_list: Optional[List[int]] = None,
+        num_inference_steps: Optional[int] = None,
+    ) -> None:
+        r"""Set up different inference schedule for the diffusion model.
+
+        You do not have to run this explicitly if you want to use the default
+        setting, but if you want other time schedules, run this function
+        between the module initialization and the main call.
+
+        Note:
+          - Recommended t_index_lists for LCMs:
+              - [0, 12, 25, 37]: Default schedule for 4 steps. Best for
+                  panorama. Not recommended if you want to use bootstrapping.
+                  Because bootstrapping stage affects the initial structuring
+                  of the generated image & in this four step LCM, this is done
+                  with only at the first step, the structure may be distorted.
+              - [0, 4, 12, 25, 37]: Recommended if you would use 1-step boot-
+                  strapping. Default initialization in this implementation.
+              - [0, 5, 16, 18, 20, 37]: Recommended if you would use 2-step
+                  bootstrapping.
+          - Due to the characteristic of SD1.5 LCM LoRA, setting
+            `num_inference_steps` larger than 20 may results in overly blurry
+            and unrealistic images. Beware!
+
+        Args:
+            t_index_list (Optional[List[int]]): The specified scheduling step
+                regarding the maximum timestep as `num_inference_steps`, which
+                is by default, 50. That means that
+                `t_index_list=[0, 12, 25, 37]` is a relative time indices basd
+                on the full scale of 50. If None, reinitialize the module with
+                the default value.
+            num_inference_steps (Optional[int]): The maximum timestep of the
+                sampler. Defines relative scale of the `t_index_list`. Rarely
+                used in practice. If None, reinitialize the module with the
+                default value.
+        """
+        if t_index_list is None:
+            t_index_list = self.default_t_list
+        if num_inference_steps is None:
+            num_inference_steps = self.default_num_inference_steps
+
         self.scheduler.set_timesteps(num_inference_steps)
+        self.timesteps = torch.as_tensor([
+            self.scheduler.timesteps[t] for t in t_index_list
+        ], dtype=torch.long)
 
-        self.generator = None
-
-        # Lock the canvas size--changing the canvas size can be implemented by reloading the module.
-        self.height = height
-        self.width = width
-        self.latent_height = int(height // self.pipe.vae_scale_factor)
-        self.latent_width = int(width // self.pipe.vae_scale_factor)
-
-        # For bootstrapping.
-        self.white = self.encode_imgs(torch.ones(1, 3, height, width, dtype=self.dtype, device=self.device))
-
-        # StreamDiffusion setting.
-        self.t_list = t_index_list
-        assert len(self.t_list) > 1, 'Current version only supports diffusion models with multiple steps.'
-        self.frame_bff_size = frame_buffer_size  # f
-        self.denoising_steps_num = len(self.t_list)  # t=2
-        self.cfg_type = cfg_type
-        self.num_inference_steps = num_inference_steps
-        self.guidance_scale = 1.0 if self.cfg_type == 'none' else guidance_scale
-        self.delta = delta
-
-        self.batch_size = self.denoising_steps_num * frame_buffer_size  # T = t*f
-        if self.cfg_type == 'initialize':
-            self.trt_unet_batch_size = (self.denoising_steps_num + 1) * self.frame_bff_size
-        elif self.cfg_type == 'full':
-            self.trt_unet_batch_size = 2 * self.denoising_steps_num * self.frame_bff_size
-        else:
-            self.trt_unet_batch_size = self.denoising_steps_num * frame_buffer_size
-
-        print(f'[INFO]     Model is loaded!')
-
-        self.reset_seed(self.generator, seed)
-        self.reset_latent()
-        self.prepare()
-
-        print(f'[INFO]     Parameters prepared!')
-
-        self.ready_checklist['initialized'] = True
-
-    @property
-    def background(self) -> BackgroundState:
-        return self.state['background']
-
-    # @property
-    # def layers(self) -> LayerState:
-    #     return self.state['layers']
-
-    @property
-    def num_layers(self) -> int:
-        return len(self.prompts) if hasattr(self, 'prompts') else 0
-
-    @property
-    def is_ready_except_flush(self) -> bool:
-        return all(v for k, v in self.ready_checklist.items() if k != 'flushed')
-
-    @property
-    def is_flush_needed(self) -> bool:
-        return self.autoflush and not self.ready_checklist['flushed']
-
-    @property
-    def is_ready(self) -> bool:
-        return self.is_ready_except_flush and not self.is_flush_needed
-
-    @property
-    def is_dirty(self) -> bool:
-        return not (self.update_buffer['background'] is None and len(self.update_buffer['layers']) == 0)
-
-    @property
-    def has_background(self) -> bool:
-        return self.background.is_empty
-
-    # @property
-    # def has_layers(self) -> bool:
-    #     return len(self.layers) > 0
-
-    def __repr__(self) -> str:
-        return (
-            f'{type(self).__name__}(\n\tbackground: {str(self.background)},\n\t'
-            f'model_key: {self.state["model_key"]}\n)'
-            # f'layers: {str(self.layers)},\n\tmodel_key: {self.state["model_key"]}\n)'
-        )
-
-    def check_integrity(self, throw_error: bool = True) -> bool:
-        p = len(self.prompts)
-        flag = (
-            p != len(self.negative_prompts) or
-            p != len(self.prompt_strengths) or
-            p != len(self.masks) or
-            p != len(self.mask_strengths) or
-            p != len(self.mask_stds) or
-            p != len(self.original_masks)
-        )
-        if flag and throw_error:
-            print(
-                f'LayerState(\n\tlen(prompts): {p},\n\tlen(negative_prompts): {len(self.negative_prompts)},\n\t'
-                f'len(prompt_strengths): {len(self.prompt_strengths)},\n\tlen(masks): {len(self.masks)},\n\t'
-                f'len(mask_stds): {len(self.mask_stds)},\n\tlen(mask_strengths): {len(self.mask_strengths)},\n\t'
-                f'len(original_masks): {len(self.original_masks)}\n)'
-            )
-            raise ValueError('[ERROR]    LayerState is corrupted!')
-        return not flag
-
-    def check_ready(self) -> bool:
-        all_except_flushed = all(v for k, v in self.ready_checklist.items() if k != 'flushed')
-        if all_except_flushed:
-            if self.is_flush_needed:
-                self.flush()
-            return True
-
-        print('[WARNING]  MagicDraw module is not ready yet! Complete the checklist:')
-        for k, v in self.ready_checklist.items():
-            prefix = '  [ v ] ' if v else '  [ x ] '
-            print(prefix + k.replace('_', ' '))
-        return False
-
-    def reset_seed(self, generator: Optional[torch.Generator] = None, seed: Optional[int] = None) -> None:
-        generator = torch.Generator(self.device) if generator is None else generator
-        seed = self.seed if seed is None else seed
-        self.generator = generator
-        self.generator.manual_seed(seed)
-
-        self.init_noise = torch.randn((self.batch_size, 4, self.latent_height, self.latent_width),
-            generator=generator, device=self.device, dtype=self.dtype)
-        self.stock_noise = torch.zeros_like(self.init_noise)
-
-        self.ready_checklist['flushed'] = False
-
-    def reset_latent(self) -> None:
-        # initialize x_t_latent (it can be any random tensor)
-        b = (self.denoising_steps_num - 1) * self.frame_bff_size
-        self.x_t_latent_buffer = torch.zeros(
-            (b, 4, self.latent_height, self.latent_width), dtype=self.dtype, device=self.device)
-
-    def reset_state(self) -> None:
-        # TODO Reset states for context switch between multiple users.
-        pass
-
-    def prepare(self) -> None:
-        # make sub timesteps list based on the indices in the t_list list and the values in the timesteps list
-        self.timesteps = self.scheduler.timesteps.to(self.device)
-        self.sub_timesteps = []
-        for t in self.t_list:
-            self.sub_timesteps.append(self.timesteps[t])
-        sub_timesteps_tensor = torch.tensor(self.sub_timesteps, dtype=torch.long, device=self.device)
-        self.sub_timesteps_tensor = sub_timesteps_tensor.repeat_interleave(self.frame_bff_size, dim=0)
+        shape = (len(t_index_list), 1, 1, 1)
 
         c_skip_list = []
         c_out_list = []
-        for timestep in self.sub_timesteps:
+        for timestep in self.timesteps:
             c_skip, c_out = self.scheduler.get_scalings_for_boundary_condition_discrete(timestep)
             c_skip_list.append(c_skip)
             c_out_list.append(c_out)
-        self.c_skip = torch.stack(c_skip_list).view(len(self.t_list), 1, 1, 1).to(dtype=self.dtype, device=self.device)
-        self.c_out = torch.stack(c_out_list).view(len(self.t_list), 1, 1, 1).to(dtype=self.dtype, device=self.device)
+        self.c_skip = torch.stack(c_skip_list).view(*shape).to(dtype=self.dtype, device=self.device)
+        self.c_out = torch.stack(c_out_list).view(*shape).to(dtype=self.dtype, device=self.device)
 
         alpha_prod_t_sqrt_list = []
         beta_prod_t_sqrt_list = []
-        for timestep in self.sub_timesteps:
+        for timestep in self.timesteps:
             alpha_prod_t_sqrt = self.scheduler.alphas_cumprod[timestep].sqrt()
             beta_prod_t_sqrt = (1 - self.scheduler.alphas_cumprod[timestep]).sqrt()
             alpha_prod_t_sqrt_list.append(alpha_prod_t_sqrt)
             beta_prod_t_sqrt_list.append(beta_prod_t_sqrt)
-        alpha_prod_t_sqrt = (torch.stack(alpha_prod_t_sqrt_list).view(len(self.t_list), 1, 1, 1)
+        alpha_prod_t_sqrt = (torch.stack(alpha_prod_t_sqrt_list).view(*shape)
             .to(dtype=self.dtype, device=self.device))
-        beta_prod_t_sqrt = (torch.stack(beta_prod_t_sqrt_list).view(len(self.t_list), 1, 1, 1)
+        beta_prod_t_sqrt = (torch.stack(beta_prod_t_sqrt_list).view(*shape)
             .to(dtype=self.dtype, device=self.device))
-        self.alpha_prod_t_sqrt = alpha_prod_t_sqrt.repeat_interleave(self.frame_bff_size, dim=0)
-        self.beta_prod_t_sqrt = beta_prod_t_sqrt.repeat_interleave(self.frame_bff_size, dim=0)
+        self.alpha_prod_t_sqrt = alpha_prod_t_sqrt
+        self.beta_prod_t_sqrt = beta_prod_t_sqrt
 
-        noise_lvs = ((1 - self.scheduler.alphas_cumprod.to(self.device)[self.sub_timesteps_tensor]) ** 0.5)
+        noise_lvs = (1 - self.scheduler.alphas_cumprod[self.timesteps].to(self.device)) ** 0.5
         self.noise_lvs = noise_lvs[None, :, None, None, None]
         self.next_noise_lvs = torch.cat([noise_lvs[1:], noise_lvs.new_zeros(1)])[None, :, None, None, None]
+
+    @torch.no_grad()
+    def get_text_embeds(self, prompt: str, negative_prompt: str) -> Tuple[torch.Tensor]:
+        r"""Text embeddings from string text prompts.
+
+        Args: 
+            prompt (str): A text prompt string.
+            negative_prompt: An optional negative text prompt string. Good for
+                high-quality generation.
+
+        Returns:
+            A tuple of (negative, positive) prompt embeddings of (1, 77, 768).
+        """
+        kwargs = dict(padding='max_length', max_length=self.tokenizer.model_max_length, return_tensors='pt')
+    
+        # Tokenize text and get embeddings.
+        text_input = self.tokenizer(prompt, truncation=True, **kwargs)
+        text_embeds = self.text_encoder(text_input.input_ids.to(self.device))[0]
+        uncond_input = self.tokenizer(negative_prompt, **kwargs)
+        uncond_embeds = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
+        return uncond_embeds, text_embeds
 
     @torch.no_grad()
     def get_text_prompts(self, image: Image.Image) -> str:
@@ -353,18 +279,21 @@ class SemanticDraw(nn.Module):
         Returns:
             A single string of text prompt.
         """
-        question = 'Question: What are in the image? Answer:'
-        inputs = self.i2t_processor(image, question, return_tensors='pt')
-        out = self.i2t_model.generate(**inputs, max_new_tokens=77)
-        prompt = self.i2t_processor.decode(out[0], skip_special_tokens=True).strip()
-        return prompt
+        if hasattr(self, 'i2t_model'):
+            question = 'Question: What are in the image? Answer:'
+            inputs = self.i2t_processor(image, question, return_tensors='pt')
+            out = self.i2t_model.generate(**inputs, max_new_tokens=77)
+            prompt = self.i2t_processor.decode(out[0], skip_special_tokens=True).strip()
+            return prompt
+        else:
+            return ''
 
     @torch.no_grad()
     def encode_imgs(
         self,
         imgs: torch.Tensor,
         generator: Optional[torch.Generator] = None,
-        add_noise: bool = False,
+        vae: Optional[nn.Module] = None,
     ) -> torch.Tensor:
         r"""A wrapper function for VAE encoder of the latent diffusion model.
 
@@ -372,7 +301,8 @@ class SemanticDraw(nn.Module):
             imgs (torch.Tensor): An image to get StableDiffusion latents.
                 Expected shape: (B, 3, H, W). Expected pixel scale: [0, 1].
             generator (Optional[torch.Generator]): Seed for KL-Autoencoder.
-            add_noise (bool): Turn this on for a noisy latent.
+            vae (Optional[nn.Module]): Explicitly specify VAE (used for
+                the demo application with TinyVAE).
 
         Returns:
             An image latent embedding with 1/8 size (depending on the auto-
@@ -390,94 +320,68 @@ class SemanticDraw(nn.Module):
             elif hasattr(encoder_output, 'latents'):
                 return encoder_output.latents
             else:
-                raise AttributeError('[ERROR]    Could not access latents of provided encoder_output')
+                raise AttributeError('Could not access latents of provided encoder_output')
 
+        vae = self.vae if vae is None else vae
         imgs = 2 * imgs - 1
-        latents = self.vae.config.scaling_factor * _retrieve_latents(self.vae.encode(imgs), generator=generator)
-        if add_noise:
-            latents = self.alpha_prod_t_sqrt[0] * latents + self.beta_prod_t_sqrt[0] * self.init_noise[0]
+        latents = vae.config.scaling_factor * _retrieve_latents(vae.encode(imgs), generator=generator)
         return latents
 
     @torch.no_grad()
-    def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+    def decode_latents(self, latents: torch.Tensor, vae: Optional[nn.Module] = None) -> torch.Tensor:
         r"""A wrapper function for VAE decoder of the latent diffusion model.
 
         Args:
             latents (torch.Tensor): An image latent to get associated images.
                 Expected shape: (B, 4, H//8, W//8).
+            vae (Optional[nn.Module]): Explicitly specify VAE (used for
+                the demo application with TinyVAE).
 
         Returns:
             An image latent embedding with 1/8 size (depending on the auto-
             encoder. Shape: (B, 3, H, W).
         """
-        latents = 1 / self.vae.config.scaling_factor * latents
-        imgs = self.vae.decode(latents).sample
+        vae = self.vae if vae is None else vae
+        latents = 1 / vae.config.scaling_factor * latents
+        imgs = vae.decode(latents).sample
         imgs = (imgs / 2 + 0.5).clip_(0, 1)
         return imgs
 
     @torch.no_grad()
-    def update_background(
-        self,
-        image: Optional[Image.Image] = None,
-        prompt: Optional[str] = None,
-        negative_prompt: Optional[str] = None,
-    ) -> bool:
-        flag_changed = False
-        if image is not None:
-            image_ = image.resize((self.width, self.height))
-            prompt = self.get_text_prompts(image_) if prompt is None else prompt
-            negative_prompt = '' if negative_prompt is None else negative_prompt
-            embed = self.pipe.encode_prompt(
-                prompt=[prompt],
-                device=self.device,
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=(self.guidance_scale > 1.0),
-                negative_prompt=[negative_prompt],
-            )  # ((1, 77, 768): cond, (1, 77, 768): uncond)
+    def get_white_background(self, height: int, width: int) -> torch.Tensor:
+        r"""White background image latent for bootstrapping or in case of
+        absent background.
 
-            self.state['background'].image = image
-            self.state['background'].latent = (
-                self.encode_imgs(T.ToTensor()(image_)[None].to(self.device, self.dtype))
-            )  # (1, 3, H, W)
-            self.state['background'].prompt = prompt
-            self.state['background'].negative_prompt = negative_prompt
-            self.state['background'].embed = embed
+        Additionally stores the maximally-sized white latent for fast retrieval
+        in the future. By default, we initially call this with 768x768 sized
+        white image, so the function is rarely visited twice.
 
-            if self.bootstrap_steps[0] > 0:
-                mix_ratio = self.bootstrap_mix_ratios[:, None, None, None]
-                self.bootstrap_latent = mix_ratio * self.white + (1.0 - mix_ratio) * self.state['background'].latent
+        Args:
+            height (int): The height of the white *image*, not its latent.
+            width (int): The width of the white *image*, not its latent.
 
-            self.ready_checklist['background_registered'] = True
-            flag_changed = True
-        else:
-            if not self.ready_checklist['background_registered']:
-                print('[WARNING]  Register background image first! Request ignored.')
-                return False
-
-            if prompt is not None:
-                self.background.prompt = prompt
-                flag_changed = True
-            if negative_prompt is not None:
-                self.background.negative_prompt = negative_prompt
-                flag_changed = True
-            if flag_changed:
-                self.background.embed = self.pipe.encode_prompt(
-                    prompt=[self.background.prompt],
-                    device=self.device,
-                    num_images_per_prompt=1,
-                    do_classifier_free_guidance=(self.guidance_scale > 1.0),
-                    negative_prompt=[self.background.negative_prompt],
-                )  # ((1, 77, 768): cond, (1, 77, 768): uncond)
-    
-        self.ready_checklist['flushed'] = not flag_changed
-        return flag_changed
+        Returns:
+            A white image latent of size (1, 4, height//8, width//8). A cropped
+            version of the stored white latent is returned if the requested
+            size is smaller than what we already have created.
+        """
+        if not hasattr(self, 'white') or self.white.shape[-2] < height or self.white.shape[-1] < width:
+            white = torch.ones(1, 3, height, width, dtype=self.dtype, device=self.device)
+            self.white = self.encode_imgs(white)
+            return self.white
+        return self.white[..., :(height // self.vae_scale_factor), :(width // self.vae_scale_factor)]
 
     @torch.no_grad()
     def process_mask(
         self,
-        masks: Optional[Union[torch.Tensor, Image.Image, List[Image.Image]]] = None,
+        masks: Union[torch.Tensor, Image.Image, List[Image.Image]],
         strength: Optional[Union[torch.Tensor, float]] = None,
         std: Optional[Union[torch.Tensor, float]] = None,
+        height: int = 512,
+        width: int = 512,
+        use_boolean_mask: bool = True,
+        timesteps: Optional[torch.Tensor] = None,
+        preprocess_mask_cover_alpha: Optional[float] = None,
     ) -> Tuple[torch.Tensor]:
         r"""Fast preprocess of masks for region-based generation with fine-
         grained controls.
@@ -525,47 +429,68 @@ class SemanticDraw(nn.Module):
             std (Optional[Union[torch.Tensor, float]]): Mask blurring Gaussian
                 kernel's standard deviation. Overrides the default value. Can
                 be applied seperately for each mask.
+            height (int): The height of the expected generation. Mask is
+                resized to (height//8, width//8) with nearest neighbor inter-
+                polation.
+            width (int): The width of the expected generation. Mask is resized
+                to (height//8, width//8) with nearest neighbor interpolation.
+            use_boolean_mask (bool): Specify this to treat the mask image as
+                a boolean tensor. The retion with dark part darker than 0.5 of
+                the maximal pixel value (that is, 127.5) is considered as the
+                designated mask.
+            timesteps (Optional[torch.Tensor]): Defines the scheduler noise
+                levels that acts as bins of mask quantization.
+            preprocess_mask_cover_alpha (Optional[float]): Optional pre-
+                processing where each mask covered by other masks is reduced in
+                its alpha value by this specified factor. Overrides the default
+                value.
 
         Returns: A tuple of tensors.
           - masks: Preprocessed (ordered, blurred, and quantized) binary/non-
                 binary masks (see the explanation on `mask_type` above) for
                 region-based image synthesis.
-          - strengths: Return mask strengths for caching.
-          - std: Return mask blur standard deviations for caching.
-          - original_masks: Return original masks for caching.
+          - masks_blurred: Gaussian blurred masks. Used for optionally
+                specified foreground-background blending after image
+                generation.
+          - std: Mask blur standard deviation. Used for optionally specified
+                foreground-background blending after image generation.
         """
-        if masks is None:
-            kwargs = {'dtype': self.dtype, 'device': self.device}
-            original_masks = torch.zeros((0, 1, self.latent_height, self.latent_width), dtype=self.dtype)
-            masks = torch.zeros((0, self.batch_size, 1, self.latent_height, self.latent_width), **kwargs)
-            strength = torch.zeros((0,), **kwargs)
-            std = torch.zeros((0,), **kwargs)
-            return masks, strength, std, original_masks
-
         if isinstance(masks, Image.Image):
             masks = [masks]
         if isinstance(masks, (tuple, list)):
             # Assumes white background for Image.Image;
             # inverted boolean masks with shape (1, 1, H, W) for torch.Tensor.
-            masks = torch.cat([
-                # (T.ToTensor()(mask.resize((self.width, self.height), Image.NEAREST)) < 0.5)[None, :1]
-                (1.0 - T.ToTensor()(mask.resize((self.width, self.height), Image.BILINEAR)))[None, :1]
-                for mask in masks
-            ], dim=0).float().clip_(0, 1)
-        original_masks = masks            
-        masks = masks.float().to(self.device)
+            if use_boolean_mask:
+                proc = lambda m: T.ToTensor()(m)[None, -1:] < 0.5
+            else:
+                proc = lambda m: 1.0 - T.ToTensor()(m)[None, -1:]
+            masks = torch.cat([proc(mask) for mask in masks], dim=0).float().clip_(0, 1)
+        masks = F.interpolate(masks.float(), size=(height, width), mode='bilinear', align_corners=False)
+        masks = masks.to(self.device)
 
         # Background mask alpha is decayed by the specified factor where foreground masks covers it.
-        if self.preprocess_mask_cover_alpha > 0:
+        if preprocess_mask_cover_alpha is None:
+            preprocess_mask_cover_alpha = self.default_preprocess_mask_cover_alpha
+        if preprocess_mask_cover_alpha > 0:
             masks = torch.stack([
                 torch.where(
                     masks[i + 1:].sum(dim=0) > 0,
-                    mask * self.preprocess_mask_cover_alpha,
+                    mask * preprocess_mask_cover_alpha,
                     mask,
                 ) if i < len(masks) - 1 else mask
                 for i, mask in enumerate(masks)
             ], dim=0)
 
+        # Scheduler noise levels for mask quantization.
+        if timesteps is None:
+            noise_lvs = self.noise_lvs
+            next_noise_lvs = self.next_noise_lvs
+        else:
+            noise_lvs_ = (1 - self.scheduler.alphas_cumprod[timesteps].to(self.device)) ** 0.5
+            noise_lvs = noise_lvs_[None, :, None, None, None]
+            next_noise_lvs = torch.cat([noise_lvs_[1:], noise_lvs_.new_zeros(1)])[None, :, None, None, None]
+
+        # Mask preprocessing parameters are fetched from the default settings.
         if std is None:
             std = self.default_mask_std
         if isinstance(std, (int, float)):
@@ -573,7 +498,6 @@ class SemanticDraw(nn.Module):
         if isinstance(std, (list, tuple)):
             std = torch.as_tensor(std, dtype=torch.float, device=self.device)
 
-        # Mask preprocessing parameters are fetched from the default settings.
         if strength is None:
             strength = self.default_mask_strength
         if isinstance(strength, (int, float)):
@@ -584,681 +508,600 @@ class SemanticDraw(nn.Module):
         if (std > 0).any():
             std = torch.where(std > 0, std, 1e-5)
             masks = gaussian_lowpass(masks, std)
+        masks_blurred = masks
+
         # NOTE: This `strength` aligns with `denoising strength`. However, with LCM, using strength < 0.96
         #       gives unpleasant results.
         masks = masks * strength[:, None, None, None]
-        masks = masks.unsqueeze(1).repeat(1, self.noise_lvs.shape[1], 1, 1, 1)
+        masks = masks.unsqueeze(1).repeat(1, noise_lvs.shape[1], 1, 1, 1)
 
+        # Mask is quantized according to the current noise levels specified by the scheduler.
         if self.mask_type == 'discrete':
             # Discrete mode.
-            masks = masks > self.noise_lvs
+            masks = masks > noise_lvs
         elif self.mask_type == 'semi-continuous':
             # Semi-continuous mode (continuous at the last step only).
             masks = torch.cat((
-                masks[:, :-1] > self.noise_lvs[:, :-1],
+                masks[:, :-1] > noise_lvs[:, :-1],
                 (
-                    (masks[:, -1:] - self.next_noise_lvs[:, -1:])
-                    / (self.noise_lvs[:, -1:] - self.next_noise_lvs[:, -1:])
+                    (masks[:, -1:] - next_noise_lvs[:, -1:]) / (noise_lvs[:, -1:] - next_noise_lvs[:, -1:])
                 ).clip_(0, 1),
             ), dim=1)
         elif self.mask_type == 'continuous':
             # Continuous mode: Have the exact same `1` coverage with discrete mode, but the mask gradually
             #                  decreases continuously after the discrete mode boundary to become `0` at the
             #                  next lower threshold.
-            masks = ((masks - self.next_noise_lvs) / (self.noise_lvs - self.next_noise_lvs)).clip_(0, 1)
+            masks = ((masks - next_noise_lvs) / (noise_lvs - next_noise_lvs)).clip_(0, 1)
 
         # NOTE: Post processing mask strength does not align with conventional 'denoising_strength'. However,
         #       fine-grained mask alpha channel tuning is available with this form.
         # masks = masks * strength[None, :, None, None, None]
 
+        h = height // self.vae_scale_factor
+        w = width // self.vae_scale_factor
         masks = rearrange(masks.float(), 'p t () h w -> (p t) () h w')
-        masks = F.interpolate(masks, size=(self.latent_height, self.latent_width), mode='nearest')
+        masks = F.interpolate(masks, size=(h, w), mode='nearest')
         masks = rearrange(masks.to(self.dtype), '(p t) () h w -> p t () h w', p=len(std))
-        return masks, strength, std, original_masks
+        return masks, masks_blurred, std
 
-    @torch.no_grad()
-    def update_layers(
+    def scheduler_step(
         self,
-        prompts: Union[str, List[str]],
-        negative_prompts: Optional[Union[str, List[str]]] = None,
-        suffix: Optional[str] = None, #', background is ',
-        prompt_strengths: Optional[Union[torch.Tensor, float, List[float]]] = None,
-        masks: Optional[Union[torch.Tensor, Image.Image, List[Image.Image]]] = None,
-        mask_strengths: Optional[Union[torch.Tensor, float, List[float]]] = None,
-        mask_stds: Optional[Union[torch.Tensor, float, List[float]]] = None,
-    ) -> None:
-        if not self.ready_checklist['background_registered']:
-            print('[WARNING]  Register background image first! Request ignored.')
-            return
-
-        ### Register prompts
-
-        if isinstance(prompts, str):
-            prompts = [prompts]
-        if negative_prompts is None:
-            negative_prompts = ''
-        if isinstance(negative_prompts, str):
-            negative_prompts = [negative_prompts]
-        fg_prompt = [p + suffix + self.background.prompt if suffix is not None else p for p in prompts]
-        self.prompts = fg_prompt
-        self.negative_prompts = negative_prompts
-        p = self.num_layers
-
-        e = self.pipe.encode_prompt(
-            prompt=fg_prompt,
-            device=self.device,
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=(self.guidance_scale > 1.0),
-            negative_prompt=negative_prompts,
-        )  # (p, 77, 768)
-
-        if prompt_strengths is None:
-            prompt_strengths = self.default_prompt_strength
-        if isinstance(prompt_strengths, (int, float)):
-            prompt_strengths = [prompt_strengths] * p
-        if isinstance(prompt_strengths, (list, tuple)):
-            prompt_strengths = torch.as_tensor(prompt_strengths, dtype=self.dtype, device=self.device)
-        self.prompt_strengths = prompt_strengths
-
-        s = prompt_strengths[:, None, None]
-        self.prompt_embeds = torch.lerp(self.background.embed[0], e[0], s).repeat(self.batch_size, 1, 1)  # (T * p, 77, 768)
-        if self.guidance_scale > 1.0 and self.cfg_type in ('initialize', 'full'):
-            b = self.batch_size if self.cfg_type == 'full' else self.frame_bff_size
-            uncond_prompt_embeds = torch.lerp(self.background.embed[1], e[1], s).repeat(b, 1, 1)  # (T * p, 77, 768)
-            self.prompt_embeds = torch.cat([uncond_prompt_embeds, self.prompt_embeds], dim=0)  # (2 * T * p, 77, 768)
-
-        self.sub_timesteps_tensor_ = self.sub_timesteps_tensor.repeat_interleave(p)  # (T * p,)
-        self.init_noise_ = self.init_noise.repeat_interleave(p, dim=0)  # (T * p, 77, 768)
-        self.stock_noise_ = self.stock_noise.repeat_interleave(p, dim=0)  # (T * p, 77, 768)
-        self.c_out_ = self.c_out.repeat_interleave(p, dim=0)  # (T * p, 1, 1, 1)
-        self.c_skip_ = self.c_skip.repeat_interleave(p, dim=0)  # (T * p, 1, 1, 1)
-        self.beta_prod_t_sqrt_ = self.beta_prod_t_sqrt.repeat_interleave(p, dim=0)  # (T * p, 1, 1, 1)
-        self.alpha_prod_t_sqrt_ = self.alpha_prod_t_sqrt.repeat_interleave(p, dim=0)  # (T * p, 1, 1, 1)
-
-        ### Register new masks
-
-        if isinstance(masks, Image.Image):
-            masks = [masks]
-        n = len(masks) if masks is not None else 0
-
-        # Modificiation.
-        masks, mask_strengths, mask_stds, original_masks = self.process_mask(masks, mask_strengths, mask_stds)
-
-        self.counts = masks.sum(dim=0)  # (T, 1, h, w)
-        self.bg_mask = (1 - self.counts).clip_(0, 1)  # (T, 1, h, w)
-        self.masks = masks  # (p, T, 1, h, w)
-        self.mask_strengths = mask_strengths  # (p,)
-        self.mask_stds = mask_stds  # (p,)
-        self.original_masks = original_masks  # (p, 1, h, w)
-
-        if p > n:
-            # Add more masks: counts and bg_masks are not changed, but only masks are changed.
-            self.masks = torch.cat((
-                self.masks,
-                torch.zeros(
-                    (p - n, self.batch_size, 1, self.latent_height, self.latent_width),
-                    dtype=self.dtype,
-                    device=self.device,
-                ),
-            ), dim=0)
-            print(f'[WARNING]  Detected more prompts ({p}) than masks ({n}). '
-                  'Automatically adds blank masks for the additional prompts.')
-        elif p < n:
-            # Warns user to add more prompts.
-            print(f'[WARNING]  Detected more masks ({n}) than prompts ({p}). '
-                  'Additional masks are ignored until more prompts are provided.')
-
-        self.ready_checklist['layers_ready'] = True
-        self.ready_checklist['flushed'] = False
-
-    @torch.no_grad()
-    def update_masks(
-        self,
-        masks: Optional[Union[torch.Tensor, Image.Image, List[Image.Image]]] = None,
-        mask_strengths: Optional[Union[torch.Tensor, float, List[float]]] = None,
-        mask_stds: Optional[Union[torch.Tensor, float, List[float]]] = None,
-    ) -> None:
-        if not self.ready_checklist['background_registered']:
-            print('[WARNING]  Register background image first! Request ignored.')
-            return
-
-        ### Register new masks
-
-        if isinstance(masks, Image.Image):
-            masks = [masks]
-        p = self.num_layers
-        n = len(masks) if masks is not None else 0
-
-        # Modificiation.
-        masks, mask_strengths, mask_stds, original_masks = self.process_mask(masks, mask_strengths, mask_stds)
-
-        self.counts = masks.sum(dim=0)  # (T, 1, h, w)
-        self.bg_mask = (1 - self.counts).clip_(0, 1)  # (T, 1, h, w)
-        self.masks = masks  # (p, T, 1, h, w)
-        self.mask_strengths = mask_strengths  # (p,)
-        self.mask_stds = mask_stds  # (p,)
-        self.original_masks = original_masks  # (p, 1, h, w)
-
-        if p > n:
-            # Add more masks: counts and bg_masks are not changed, but only masks are changed.
-            self.masks = torch.cat((
-                self.masks,
-                torch.zeros(
-                    (p - n, self.batch_size, 1, self.latent_height, self.latent_width),
-                    dtype=self.dtype,
-                    device=self.device,
-                ),
-            ), dim=0)
-            print(f'[WARNING]  Detected more prompts ({p}) than masks ({n}). '
-                  'Automatically adds blank masks for the additional prompts.')
-        elif p < n:
-            # Warns user to add more prompts.
-            print(f'[WARNING]  Detected more masks ({n}) than prompts ({p}). '
-                  'Additional masks are ignored until more prompts are provided.')
-
-    @torch.no_grad()
-    def update_single_layer(
-        self,
-        idx: Optional[int] = None,
-        prompt: Optional[str] = None,
-        negative_prompt: Optional[str] = None,
-        suffix: Optional[str] = None, #', background is ',
-        prompt_strength: Optional[float] = None,
-        mask: Optional[Union[torch.Tensor, Image.Image]] = None,
-        mask_strength: Optional[float] = None,
-        mask_std: Optional[float] = None,
-    ) -> None:
-
-        ### Possible input combinations and expected behaviors
-
-        # The module will consider a layer, a pair of (prompt, mask), to be 'active' only if a prompt
-        # is registered. A blank mask will be assigned if no mask is provided for the 'active' layer.
-        # The layers should be in either of ('active', 'inactive') states. 'inactive' layers will not
-        # receive any input unless equipped with prompt. 'active' layers receive any input and modify
-        # their states accordingly. In the actual implementation, only the 'active' layers are stored
-        # and can be accessed by the fields. Values len(self.prompts) = self.num_layers is the number
-        # of 'active' layers.
-
-        # If no background is registered. The layers should be all 'inactive'.
-        if not self.ready_checklist['background_registered']:
-            print('[WARNING]  Register background image first! Request ignored.')
-            return
-
-        # The first layer create request should be carrying a prompt. If only mask is drawn without a
-        # prompt, it just ignores the request--the user will update her request soon.
-        if self.num_layers == 0:
-            if prompt is not None:
-                self.update_layers(
-                    prompts=prompt,
-                    negative_prompts=negative_prompt,
-                    suffix=suffix,
-                    prompt_strengths=prompt_strength,
-                    masks=mask,
-                    mask_strengths=mask_strength,
-                    mask_stds=mask_std,
-                )
-            return
-
-        # Invalid request indices -> considered as a layer add request.
-        if idx is None or idx > self.num_layers or idx < 0:
-            idx = self.num_layers
-
-        # Two modes for the layer edits: 'append mode' and 'edit mode'. 'append mode' appends a new
-        # layer at the end of the layers list. 'edit mode' modifies internal variables for the given
-        # index. 'append mode' is defined by the request index and strictly requires a prompt input.
-        is_appending = idx == self.num_layers
-        if is_appending and prompt is None:
-            print(f'[WARNING]  Creating a new prompt at index ({idx}) but found no prompt. Request ignored.')
-            return
-
-        ### Register prompts
-
-        # | prompt    | neg_prompt | append mode (idx==len)  | edit mode (idx<len)  |
-        # | --------- | ---------- | ----------------------- | -------------------- |
-        # | given     | given      | append new prompt embed | replace prompt embed |
-        # | given     | not given  | append new prompt embed | replace prompt embed |
-        # | not given | given      | NOT ALLOWED             | replace prompt embed |
-        # | not given | not given  | NOT ALLOWED             | do nothing           |
-
-        # | prompt_strength | append mode (idx==len) | edit mode (idx<len)                            |
-        # | --------------- | ---------------------- | ---------------------------------------------- |
-        # | given           | use given strength     | use given strength                             |
-        # | not given       | use default strength   | replace strength / if no existing, use default |
-
-        p = self.num_layers
-
-        flag_prompt_edited = (
-            prompt is not None or
-            negative_prompt is not None or
-            prompt_strength is not None
-        )
-
-        if flag_prompt_edited:
-            is_double_cond = self.guidance_scale > 1.0 and self.cfg_type in ('initialize', 'full')
-
-            # Synchonize the internal state.
-
-            # We have asserted that prompt is not None if the mode is 'appending'.
-            if prompt is not None:
-                if suffix is not None:
-                    prompt = prompt + suffix + self.background.prompt
-                if is_appending:
-                    self.prompts.append(prompt)
-                else:
-                    self.prompts[idx] = prompt
-
-            if negative_prompt is not None:
-                if is_appending:
-                    self.negative_prompts.append(negative_prompt)
-                else:
-                    self.negative_prompts[idx] = negative_prompt
-            elif is_appending:
-                # Make sure that negative prompts are well specified.
-                self.negative_prompts.append('')
-
-            if is_appending:
-                if prompt_strength is None:
-                    prompt_strength = self.default_prompt_strength
-                self.prompt_strengths = torch.cat((
-                    self.prompt_strengths,
-                    torch.as_tensor([prompt_strength], dtype=self.dtype, device=self.device),
-                ), dim=0)
-            elif prompt_strength is not None:
-                self.prompt_strengths[idx] = prompt_strength
-
-            # Edit currently stored prompt embeddings.
-
-            if is_double_cond:
-                uncond_prompt_embed_, prompt_embed_ = torch.chunk(self.prompt_embeds, 2, dim=0)
-                uncond_prompt_embed_ = rearrange(uncond_prompt_embed_, '(t p) c1 c2 -> t p c1 c2', p=p)
-                prompt_embed_ = rearrange(prompt_embed_, '(t p) c1 c2 -> t p c1 c2', p=p)
-            else:
-                uncond_prompt_embed_ = None
-                prompt_embed_ = rearrange(self.prompt_embeds, '(t p) c1 c2 -> t p c1 c2', p=p)
-
-            e = self.pipe.encode_prompt(
-                prompt=self.prompts[idx],
-                device=self.device,
-                num_images_per_prompt=1,
-                do_classifier_free_guidance=(self.guidance_scale > 1.0),
-                negative_prompt=self.negative_prompts[idx],
-            )  # (1, 77, 768), (1, 77, 768)
-
-            s = self.prompt_strengths[idx]
-            t = prompt_embed_.shape[0]
-            prompt_embed = torch.lerp(self.background.embed[0], e[0], s)[None].repeat(t, 1, 1, 1)  # (1, 77, 768)
-            if is_double_cond:
-                uncond_prompt_embed = torch.lerp(self.background.embed[1], e[1], s)[None].repeat(t, 1, 1, 1)  # (1, 77, 768)
-
-            if is_appending:
-                prompt_embed_ = torch.cat((prompt_embed_, prompt_embed), dim=1)
-                if is_double_cond:
-                    uncond_prompt_embed_ = torch.cat((uncond_prompt_embed_, uncond_prompt_embed), dim=1)
-            else:
-                prompt_embed_[:, idx:(idx + 1)] = prompt_embed
-                if is_double_cond:
-                    uncond_prompt_embed_[:, idx:(idx + 1)] = uncond_prompt_embed
-
-            self.prompt_embeds = rearrange(prompt_embed_, 't p c1 c2 -> (t p) c1 c2')
-            if is_double_cond:
-                uncond_prompt_embeds = rearrange(uncond_prompt_embed_, 't p c1 c2 -> (t p) c1 c2')
-                self.prompt_embeds = torch.cat([uncond_prompt_embeds, self.prompt_embeds], dim=0)  # (2 * T * p, 77, 768)
-
-            self.ready_checklist['flushed'] = False
-
-        if is_appending:
-            p = self.num_layers
-            self.sub_timesteps_tensor_ = self.sub_timesteps_tensor.repeat_interleave(p)  # (T * p,)
-            self.init_noise_ = self.init_noise.repeat_interleave(p, dim=0)  # (T * p, 77, 768)
-            self.stock_noise_ = self.stock_noise.repeat_interleave(p, dim=0)  # (T * p, 77, 768)
-            self.c_out_ = self.c_out.repeat_interleave(p, dim=0)  # (T * p, 1, 1, 1)
-            self.c_skip_ = self.c_skip.repeat_interleave(p, dim=0)  # (T * p, 1, 1, 1)
-            self.beta_prod_t_sqrt_ = self.beta_prod_t_sqrt.repeat_interleave(p, dim=0)  # (T * p, 1, 1, 1)
-            self.alpha_prod_t_sqrt_ = self.alpha_prod_t_sqrt.repeat_interleave(p, dim=0)  # (T * p, 1, 1, 1)
-
-        ### Register new masks
-
-        # | mask      | std / str | append mode (idx==len)       | edit mode (idx<len)           |
-        # | --------- | --------- | ---------------------------- | ----------------------------- |
-        # | given     | given     | create mask with given val   | create mask with given val    |
-        # | given     | not given | create mask with default val | create mask with existing val |
-        # | not given | given     | create blank mask            | replace mask with given val   |
-        # | not given | not given | create blank mask            | do nothing                    |
-
-        flag_nonzero_mask = False
-        if mask is not None:
-            # Mask image is given -> create mask.
-            mask, strength, std, original_mask = self.process_mask(mask, mask_strength, mask_std)
-            flag_nonzero_mask = True
-
-        elif is_appending:
-            # No given mask & append mode  -> create white mask.
-            mask = torch.zeros(
-                (1, self.batch_size, 1, self.latent_height, self.latent_width),
-                dtype=self.dtype,
-                device=self.device,
-            )
-            strength = torch.as_tensor([self.default_mask_strength], dtype=self.dtype, device=self.device)
-            std = torch.as_tensor([self.default_mask_std], dtype=self.dtype, device=self.device)
-            original_mask = torch.zeros((1, 1, self.height, self.width), dtype=self.dtype, device=self.device)
-
-        elif mask_std is not None or mask_strength is not None:
-            # No given mask & edit mode & given std / str -> replace existing mask with given std / str.
-            if mask_std is None:
-                mask_std = self.mask_stds[idx:(idx + 1)]
-            if mask_strength is None:
-                mask_strength = self.mask_strengths[idx:(idx + 1)]
-            mask, strength, std, original_mask = self.process_mask(
-                self.original_masks[idx:(idx + 1)], mask_strength, mask_std)
-            flag_nonzero_mask = True
-
-        else:
-            # No given mask & no given std & edit mode -> Do nothing.
-            return
-
-        if is_appending:
-            # Append mode.
-            self.masks = torch.cat((self.masks, mask), dim=0)  # (p, T, 1, h, w)
-            self.mask_strengths = torch.cat((self.mask_strengths, strength), dim=0)  # (p,)
-            self.mask_stds = torch.cat((self.mask_stds, std), dim=0)  # (p,)
-            self.original_masks = torch.cat((self.original_masks, original_mask), dim=0)  # (p, 1, h, w)
-            if flag_nonzero_mask:
-                self.counts = self.counts + mask[0] if hasattr(self, 'counts') else mask[0]  # (T, 1, h, w)
-                self.bg_mask = (1 - self.counts).clip_(0, 1)  # (T, 1, h, w)
-        else:
-            # Edit mode.
-            if flag_nonzero_mask:
-                self.counts = self.counts - self.masks[idx] + mask[0]  # (T, 1, h, w)
-                self.bg_mask = (1 - self.counts).clip_(0, 1)  # (T, 1, h, w) 
-            self.masks[idx:(idx + 1)] = mask  # (p, T, 1, h, w)
-            self.mask_strengths[idx:(idx + 1)] = strength  # (p,)
-            self.mask_stds[idx:(idx + 1)] = std  # (p,)
-            self.original_masks[idx:(idx + 1)] = original_mask  # (p, 1, h, w)
-
-        # if flag_nonzero_mask:
-        #     self.ready_checklist['flushed'] = False
-
-    @torch.no_grad()
-    def register_all(
-        self,
-        prompts: Union[str, List[str]],
-        masks: Union[Image.Image, List[Image.Image]],
-        background: Image.Image,
-        background_prompt: Optional[str] = None,
-        background_negative_prompt: str = '',
-        negative_prompts: Union[str, List[str]] = '',
-        suffix: Optional[str] = None, #', background is ',
-        prompt_strengths: float = 1.0,
-        mask_strengths: float = 1.0,
-        mask_stds: Union[torch.Tensor, float] = 10.0,
-    ) -> None:
-        # The order of this registration should not be changed!
-        self.update_background(background, background_prompt, background_negative_prompt)
-        self.update_layers(prompts, negative_prompts, suffix, prompt_strengths, masks, mask_strengths, mask_stds)
-
-    def update(
-        self,
-        background: Optional[Image.Image] = None,
-        background_prompt: Optional[str] = None,
-        background_negative_prompt: Optional[str] = None,
-        idx: Optional[int] = None,
-        prompt: Optional[str] = None,
-        negative_prompt: Optional[str] = None,
-        suffix: Optional[str] = None,
-        prompt_strength: Optional[float] = None,
-        mask: Optional[Union[torch.Tensor, Image.Image]] = None,
-        mask_strength: Optional[float] = None,
-        mask_std: Optional[float] = None,
-    ) -> None:
-        # For lazy update (to solve minor synchonization problem with gradio).
-        bq = BackgroundObject(
-            image=background,
-            prompt=background_prompt,
-            negative_prompt=background_negative_prompt,
-        )
-        if not bq.is_empty:
-            self.update_buffer['background'] = bq
-
-        lq = LayerObject(
-            idx=idx,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            suffix=suffix,
-            prompt_strength=prompt_strength,
-            mask=mask,
-            mask_strength=mask_strength,
-            mask_std=mask_std,
-        )
-        if not lq.is_empty:
-            limit = self.update_buffer['layers'].maxlen
-
-            # Optimize the prompt queue: Overrride uncommitted layers with the same idx.
-            new_q = deque(maxlen=limit)
-            for _ in range(len(self.update_buffer['layers'])):
-                # Check from the newest to the oldest.
-                # Copy old requests only if the current query does not carry those requests.
-                query = self.update_buffer['layers'].pop()
-                overriden = lq.merge(query)
-                if not overriden:
-                    new_q.appendleft(query)
-            self.update_buffer['layers'] = new_q
-
-            if len(self.update_buffer['layers']) == limit:
-                print(f'[WARNING]  Maximum prompt change query limit ({limit}) is reached. '
-                      f'Current query {lq} will be ignored.')
-            else:
-                self.update_buffer['layers'].append(lq)
-
-    @torch.no_grad()
-    def commit(self) -> None:
-        flag_changed = self.is_dirty
-        bq = self.update_buffer['background']
-        lq = self.update_buffer['layers']
-        count_bq_req = int(bq is not None and not bq.is_empty)
-        count_lq_req = len(lq)
-
-        if flag_changed:
-            print(f'[INFO]     Requests found: {count_bq_req} background requests '
-                  f'& {count_lq_req} layer requests:\n{str(bq)}, {", ".join([str(l) for l in lq])}')
-
-        bq = self.update_buffer['background']
-        if bq is not None:
-            self.update_background(**vars(bq))
-            self.update_buffer['background'] = None
-
-        while len(lq) > 0:
-            l = lq.popleft()
-            self.update_single_layer(**vars(l))
-
-        if flag_changed:
-            print(f'[INFO]     Requests resolved: {count_bq_req} background requests '
-                  f'& {count_lq_req} layer requests.')
-
-    def scheduler_step_batch(
-        self,
-        model_pred_batch: torch.Tensor,
-        x_t_latent_batch: torch.Tensor,
-        idx: Optional[int] = None,
+        noise_pred: torch.Tensor,
+        idx: int,
+        latent: torch.Tensor,
     ) -> torch.Tensor:
         r"""Denoise-only step for reverse diffusion scheduler.
+        
+        Designed to match the interface of the original `pipe.scheduler.step`,
+        which is a combination of this method and the following
+        `scheduler_add_noise`.
 
         Args:
-            model_pred_batch (torch.Tensor): Noise prediction results.
-            x_t_latent_batch (torch.Tensor): Noisy latent.
-            idx (Optional[int]): Instead of timesteps (in [0, 1000]-scale) use
-                indices for the timesteps tensor (ranged in
-                [0, len(timesteps)-1]). Specify only if a single-index, not
-                stream-batched inference is what you want.
+            noise_pred (torch.Tensor): Noise prediction results from the U-Net.
+            idx (int): Instead of timesteps (in [0, 1000]-scale) use indices
+                for the timesteps tensor (ranged in [0, len(timesteps)-1]).
+            latent (torch.Tensor): Noisy latent.
 
         Returns:
             A denoised tensor with the same size as latent.
         """
-        if idx is None:
-            F_theta = (x_t_latent_batch - self.beta_prod_t_sqrt_ * model_pred_batch) / self.alpha_prod_t_sqrt_
-            denoised_batch = self.c_out_ * F_theta + self.c_skip_ * x_t_latent_batch
-        else:
-            F_theta = (x_t_latent_batch - self.beta_prod_t_sqrt[idx] * model_pred_batch) / self.alpha_prod_t_sqrt[idx]
-            denoised_batch = self.c_out[idx] * F_theta + self.c_skip[idx] * x_t_latent_batch
-        return denoised_batch
+        F_theta = (latent - self.beta_prod_t_sqrt[idx] * noise_pred) / self.alpha_prod_t_sqrt[idx]
+        return self.c_out[idx] * F_theta + self.c_skip[idx] * latent
 
-    def unet_step(
+    def scheduler_add_noise(
         self,
-        x_t_latent: torch.Tensor,  # (T, 4, h, w)
-        idx: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        p = self.num_layers
-        x_t_latent = x_t_latent.repeat_interleave(p, dim=0)  # (T * p, 4, h, w)
+        latent: torch.Tensor,
+        noise: Optional[torch.Tensor],
+        idx: int,
+    ) -> torch.Tensor:
+        r"""Separated noise-add step for the reverse diffusion scheduler.
+        
+        Designed to match the interface of the original
+        `pipe.scheduler.add_noise`.
 
-        if self.bootstrap_steps[0] > 0:
-            # Background bootstrapping.
-            bootstrap_latent = self.scheduler.add_noise(
-                self.bootstrap_latent,
-                self.stock_noise,
-                torch.tensor(self.sub_timesteps_tensor, device=self.device),
-            )
-            x_t_latent = rearrange(x_t_latent, '(t p) c h w -> p t c h w', p=p)
-            bootstrap_mask = (
-                self.masks * self.bootstrap_steps[None, :, None, None, None]
-                + (1.0 - self.bootstrap_steps[None, :, None, None, None])
-            ) # (p, t, c, h, w)
-            x_t_latent = (1.0 - bootstrap_mask) * bootstrap_latent[None] + bootstrap_mask * x_t_latent
-            x_t_latent = rearrange(x_t_latent, 'p t c h w -> (t p) c h w')
+        Args:
+            latent (torch.Tensor): Denoised latent.
+            noise (torch.Tensor): Added noise. Can be None. If None, a random
+                noise is newly sampled for addition.
+            idx (int): Instead of timesteps (in [0, 1000]-scale) use indices
+                for the timesteps tensor (ranged in [0, len(timesteps)-1]).
 
-            # Centering.
-            x_t_latent = shift_to_mask_bbox_center(x_t_latent, rearrange(self.masks, 'p t c h w -> (t p) c h w'), reverse=True)
+        Returns:
+            A noisy tensor with the same size as latent.
+        """
+        if idx >= len(self.alpha_prod_t_sqrt) or idx < 0:
+            # The last step does not require noise addition.
+            return latent
+        noise = torch.randn_like(latent) if noise is None else noise
+        return self.alpha_prod_t_sqrt[idx] * latent + self.beta_prod_t_sqrt[idx] * noise
 
-        t_list = self.sub_timesteps_tensor_  # (T * p,)
-        if self.guidance_scale > 1.0 and self.cfg_type == 'initialize':
-            x_t_latent_plus_uc = torch.concat([x_t_latent[:p], x_t_latent], dim=0)  # (T * p + 1, 4, h, w)
-            t_list = torch.concat([t_list[:p], t_list], dim=0)  # (T * p + 1, 4, h, w)
-        elif self.guidance_scale > 1.0 and self.cfg_type == 'full':
-            x_t_latent_plus_uc = torch.concat([x_t_latent, x_t_latent], dim=0)  # (2 * T * p, 4, h, w)
-            t_list = torch.concat([t_list, t_list], dim=0)  # (2 * T * p,)
+    @torch.no_grad()
+    def sample(
+        self,
+        prompts: Union[str, List[str]],
+        negative_prompts: Union[str, List[str]] = '',
+        height: int = 512,
+        width: int = 512,
+        num_inference_steps: Optional[int] = None,
+        guidance_scale: Optional[float] = None,
+        batch_size: int = 1,
+    ) -> Image.Image:
+        r"""StableDiffusionPipeline for single-prompt single-tile generation.
+
+        Minimal Example:
+            >>> device = torch.device('cuda:0')
+            >>> smd = SemanticDrawPipeline(device)
+            >>> image = smd.sample('A photo of the dolomites')
+            >>> image.save('my_creation.png')
+
+        Args:
+            prompts (Union[str, List[str]]): A text prompt.
+            negative_prompts (Union[str, List[str]]): A negative text prompt.
+            height (int): Height of a generated image.
+            width (int): Width of a generated image.
+            num_inference_steps (Optional[int]): Number of inference steps.
+                Default inference scheduling is used if none is specified.
+            guidance_scale (Optional[float]): Classifier guidance scale.
+                Default value is used if none is specified.
+            batch_size (int): Number of images to generate.
+
+        Returns: A PIL.Image image.
+        """
+        if num_inference_steps is None:
+            num_inference_steps = self.default_num_inference_steps
+        if guidance_scale is None:
+            guidance_scale = self.default_guidance_scale
+        self.scheduler.set_timesteps(num_inference_steps)
+
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        if isinstance(negative_prompts, str):
+            negative_prompts = [negative_prompts]
+
+        # Calculate text embeddings.
+        uncond_embeds, text_embeds = self.get_text_embeds(prompts, negative_prompts)  # [2, 77, 768]
+        text_embeds = torch.cat([uncond_embeds.mean(dim=0, keepdim=True), text_embeds.mean(dim=0, keepdim=True)])
+        h = height // self.vae_scale_factor
+        w = width // self.vae_scale_factor
+        latent = torch.randn((batch_size, self.unet.config.in_channels, h, w), dtype=self.dtype, device=self.device)
+
+        with torch.autocast('cuda'):
+            for i, t in enumerate(tqdm(self.scheduler.timesteps)):
+                # Expand the latents if we are doing classifier-free guidance.
+                latent_model_input = torch.cat([latent] * 2)
+
+                # Perform one step of the reverse diffusion.
+                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeds)['sample']
+                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                latent = self.scheduler.step(noise_pred, t, latent)['prev_sample']
+
+        # Return PIL Image.
+        latent = latent.to(dtype=self.dtype)
+        imgs = [T.ToPILImage()(self.decode_latents(l[None])[0]) for l in latent]
+        return imgs
+
+    @torch.no_grad()
+    def sample_panorama(
+        self,
+        prompts: Union[str, List[str]],
+        negative_prompts: Union[str, List[str]] = '',
+        height: int = 512,
+        width: int = 2048,
+        num_inference_steps: Optional[int] = None,
+        guidance_scale: Optional[float] = None,
+        tile_size: Optional[int] = None,
+    ) -> Image.Image:
+        r"""Large size image generation from a single set of prompts.
+
+        Minimal Example:
+            >>> device = torch.device('cuda:0')
+            >>> smd = SemanticDrawPipeline(device)
+            >>> image = smd.sample_panorama(
+            >>>     'A photo of Alps', height=512, width=3072)
+            >>> image.save('my_panorama_creation.png')
+
+        Args:
+            prompts (Union[str, List[str]]): A text prompt.
+            negative_prompts (Union[str, List[str]]): A negative text prompt.
+            height (int): Height of a generated image. It is tiled if larger
+                than `tile_size`.
+            width (int): Width of a generated image. It is tiled if larger
+                than `tile_size`.
+            num_inference_steps (Optional[int]): Number of inference steps.
+                Default inference scheduling is used if none is specified.
+            guidance_scale (Optional[float]): Classifier guidance scale.
+                Default value is used if none is specified.
+            tile_size (Optional[int]): Tile size of the panorama generation.
+                Works best with the default training size of the Stable-
+                Diffusion model, i.e., 512 or 768 for SD1.5 and 1024 for SDXL.
+
+        Returns: A PIL.Image image of a panorama (large-size) image.
+        """
+        if num_inference_steps is None:
+            num_inference_steps = self.default_num_inference_steps
+            self.scheduler.set_timesteps(num_inference_steps)
+            timesteps = self.timesteps
+            use_custom_timesteps = False
         else:
-            x_t_latent_plus_uc = x_t_latent  # (T * p, 4, h, w)
+            self.scheduler.set_timesteps(num_inference_steps)
+            timesteps = self.scheduler.timesteps
+            use_custom_timesteps = True
+        if guidance_scale is None:
+            guidance_scale = self.default_guidance_scale
 
-        model_pred = self.unet(
-            x_t_latent_plus_uc,  # (B, 4, h, w)
-            t_list,  # (B,)
-            encoder_hidden_states=self.prompt_embeds,  # (B, 77, 768)
-            return_dict=False,
-            # TODO: Add SDXL Support.
-            # added_cond_kwargs={'text_embeds': add_text_embeds, 'time_ids': add_time_ids},
-        )[0]  # (B, 4, h, w)
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        if isinstance(negative_prompts, str):
+            negative_prompts = [negative_prompts]
 
-        if self.bootstrap_steps[0] > 0:
-            # Uncentering.
-            bootstrap_mask = rearrange(self.masks, 'p t c h w -> (t p) c h w')
-            if self.guidance_scale > 1.0 and self.cfg_type == 'initialize':
-                bootstrap_mask_ = torch.concat([bootstrap_mask[:p], bootstrap_mask], dim=0)
-            elif self.guidance_scale > 1.0 and self.cfg_type == 'full':
-                bootstrap_mask_ = torch.concat([bootstrap_mask, bootstrap_mask], dim=0)
-            else:
-                bootstrap_mask_ = bootstrap_mask
-            model_pred = shift_to_mask_bbox_center(model_pred, bootstrap_mask_)
-            x_t_latent = shift_to_mask_bbox_center(x_t_latent, bootstrap_mask)
+        # Calculate text embeddings.
+        uncond_embeds, text_embeds = self.get_text_embeds(prompts, negative_prompts)  # [2, 77, 768]
+        text_embeds = torch.cat([uncond_embeds.mean(dim=0, keepdim=True), text_embeds.mean(dim=0, keepdim=True)])
 
-            # # Remove leakage (optional).
-            # leak = (latent_ - bg_latent_).pow(2).mean(dim=1, keepdim=True)
-            # leak_sigmoid = torch.sigmoid(leak / self.bootstrap_leak_sensitivity) * 2 - 1
-            # fg_mask_ = fg_mask_ * leak_sigmoid
+        # Define panorama grid and get views
+        h = height // self.vae_scale_factor
+        w = width // self.vae_scale_factor
+        latent = torch.randn((1, self.unet.config.in_channels, h, w), dtype=self.dtype, device=self.device)
 
-        ### noise_pred_text, noise_pred_uncond: (T * p, 4, h, w)
-        ### self.stock_noise, init_noise: (T, 4, h, w)
+        if tile_size is None:
+            tile_size = min(min(height, width), 512)
+        views, masks = get_panorama_views(h, w, tile_size // self.vae_scale_factor)
+        masks = masks.to(dtype=self.dtype, device=self.device)
+        value = torch.zeros_like(latent)
+        with torch.autocast('cuda'):
+            for i, t in enumerate(tqdm(timesteps)):
+                value.zero_()
 
-        if self.guidance_scale > 1.0 and self.cfg_type == 'initialize':
-            noise_pred_text = model_pred[p:]
-            self.stock_noise_ = torch.concat([model_pred[:p], self.stock_noise_[p:]], dim=0)
-        elif self.guidance_scale > 1.0 and self.cfg_type == 'full':
-            noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
-        else:
-            noise_pred_text = model_pred
-        if self.guidance_scale > 1.0 and self.cfg_type in ('self', 'initialize'):
-            noise_pred_uncond = self.stock_noise_ * self.delta
+                for j, (h_start, h_end, w_start, w_end) in enumerate(views):
+                    # TODO we can support batches, and pass multiple views at once to the unet
+                    latent_view = latent[:, :, h_start:h_end, w_start:w_end]
 
-        if self.guidance_scale > 1.0 and self.cfg_type != 'none':
-            model_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-        else:
-            model_pred = noise_pred_text
+                    # Expand the latents if we are doing classifier-free guidance.
+                    latent_model_input = torch.cat([latent_view] * 2)
 
-        # compute the previous noisy sample x_t -> x_t-1
-        denoised_batch = self.scheduler_step_batch(model_pred, x_t_latent, idx)
+                    # Perform one step of the reverse diffusion.
+                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeds)['sample']
+                    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-        if self.cfg_type in ('self' , 'initialize'):
-            scaled_noise = self.beta_prod_t_sqrt_ * self.stock_noise_
-            delta_x = self.scheduler_step_batch(model_pred, scaled_noise, idx)
+                    # Compute the denoising step.
+                    latents_view_denoised = self.scheduler_step(noise_pred, i, latent_view) # (1, 4, h, w)
+                    mask = masks[..., j:j + 1, h_start:h_end, w_start:w_end] # (1, 1, h, w)
+                    value[..., h_start:h_end, w_start:w_end] += mask * latents_view_denoised # (1, 1, h, w)
 
-            # Do mask edit.
-            alpha_next = torch.concat([self.alpha_prod_t_sqrt_[p:], torch.ones_like(self.alpha_prod_t_sqrt_[:p])], dim=0)
-            delta_x = alpha_next * delta_x
-            beta_next = torch.concat([self.beta_prod_t_sqrt_[p:], torch.ones_like(self.beta_prod_t_sqrt_[:p])], dim=0)
-            delta_x = delta_x / beta_next
-            init_noise = torch.concat([self.init_noise_[p:], self.init_noise_[:p]], dim=0)
-            self.stock_noise_ = init_noise + delta_x
+                # Update denoised latent.
+                latent = value.clone()
 
-        p2 = len(self.t_list) - 1
-        background = torch.concat([
-            self.scheduler.add_noise(
-                self.background.latent.repeat(p2, 1, 1, 1),
-                self.stock_noise[1:],
-                torch.tensor(self.t_list[1:], device=self.device),
-            ),
-            self.background.latent,
-        ], dim=0)
+                if i < len(timesteps) - 1:
+                    latent = self.scheduler_add_noise(latent, None, i + 1)
 
-        denoised_batch = rearrange(denoised_batch, '(t p) c h w -> p t c h w', p=p)
-        latent = (self.masks * denoised_batch).sum(dim=0)  # (T, 4, h, w)
-        latent = torch.where(self.counts > 0, latent / self.counts, latent)
-
-        # latent = (
-        #     (1 - self.bg_mask) * self.mask_strengths * latent
-        #     + ((1 - self.bg_mask) * (1.0 - self.mask_strengths) + self.bg_mask) * background
-        # )
-        latent = (1 - self.bg_mask) * latent + self.bg_mask * background
-
-        return latent
+        # Return PIL Image.
+        imgs = self.decode_latents(latent)
+        img = T.ToPILImage()(imgs[0].cpu())
+        return img
 
     @torch.no_grad()
     def __call__(
         self,
-        no_decode: bool = False,
-        ignore_check_ready: bool = False,
-    ) -> Optional[Union[torch.Tensor, Image.Image]]:
-        if not ignore_check_ready and not self.check_ready():
-            return
-        if not ignore_check_ready and self.is_dirty:
-            print("I'm dirty!")
-            self.commit()
-            self.flush()
+        prompts: Optional[Union[str, List[str]]] = None,
+        negative_prompts: Union[str, List[str]] = '',
+        suffix: Optional[str] = None, #', background is ',
+        background: Optional[Union[torch.Tensor, Image.Image]] = None,
+        background_prompt: Optional[str] = None,
+        background_negative_prompt: str = '',
+        height: int = 512,
+        width: int = 512,
+        num_inference_steps: Optional[int] = None,
+        guidance_scale: Optional[float] = None,
+        prompt_strengths: Optional[Union[torch.Tensor, float, List[float]]] = None,
+        masks: Optional[Union[Image.Image, List[Image.Image]]] = None,
+        mask_strengths: Optional[Union[torch.Tensor, float, List[float]]] = None,
+        mask_stds: Optional[Union[torch.Tensor, float, List[float]]] = None,
+        use_boolean_mask: bool = True,
+        do_blend: bool = True,
+        tile_size: int = 768,
+        bootstrap_steps: Optional[int] = None,
+        boostrap_mix_steps: Optional[float] = None,
+        bootstrap_leak_sensitivity: Optional[float] = None,
+        preprocess_mask_cover_alpha: Optional[float] = None,
+    ) -> Image.Image:
+        r"""Arbitrary-size image generation from multiple pairs of (regional)
+        text prompt-mask pairs.
 
-        if self.seedfix:
-            self.reset_seed(self.generator, self.seed)
-            latent = self.init_noise[:1]
+        This is a main routine for this pipeline.
+
+        Example:
+            >>> device = torch.device('cuda:0')
+            >>> smd = SemanticDrawPipeline(device)
+            >>> prompts = {... specify prompts}
+            >>> masks = {... specify mask tensors}
+            >>> height, width = masks.shape[-2:]
+            >>> image = smd(
+            >>>     prompts, masks=masks.float(), height=height, width=width)
+            >>> image.save('my_beautiful_creation.png')
+
+        Args:
+            prompts (Union[str, List[str]]): A text prompt.
+            negative_prompts (Union[str, List[str]]): A negative text prompt.
+            suffix (Optional[str]): One option for blending foreground prompts
+                with background prompts by simply appending background prompt
+                to the end of each foreground prompt with this `middle word` in
+                between. For example, if you set this as `, background is`,
+                then the foreground prompt will be changed into
+                `(fg), background is (bg)` before conditional generation.
+            background (Optional[Union[torch.Tensor, Image.Image]]): a
+                background image, if the user wants to draw in front of the
+                specified image. Background prompt will automatically generated
+                with a BLIP-2 model.
+            background_prompt (Optional[str]): The background prompt is used
+                for preprocessing foreground prompt embeddings to blend
+                foreground and background.
+            background_negative_prompt (Optional[str]): The negative background
+                prompt.
+            height (int): Height of a generated image. It is tiled if larger
+                than `tile_size`.
+            width (int): Width of a generated image. It is tiled if larger
+                than `tile_size`.
+            num_inference_steps (Optional[int]): Number of inference steps.
+                Default inference scheduling is used if none is specified.
+            guidance_scale (Optional[float]): Classifier guidance scale.
+                Default value is used if none is specified.
+            prompt_strength (float): Overrides default value. Preprocess
+                foreground prompts globally by linearly interpolating its
+                embedding with the background prompt embeddint with specified
+                mix ratio. Useful control handle for foreground blending.
+                Recommended range: 0.5-1.
+            masks (Optional[Union[Image.Image, List[Image.Image]]]): a list of
+                mask images. Each mask associates with each of the text prompts
+                and each of the negative prompts. If specified as an image, it
+                regards the image as a boolean mask. Also accepts torch.Tensor
+                masks, which can have nonbinary values for fine-grained
+                controls in mixing regional generations.
+            mask_strengths (Optional[Union[torch.Tensor, float, List[float]]]):
+                Overrides the default value. an be assigned for each mask
+                separately. Preprocess mask by multiplying it globally with the
+                specified variable. Caution: extremely sensitive. Recommended
+                range: 0.98-1.
+            mask_stds (Optional[Union[torch.Tensor, float, List[float]]]):
+                Overrides the default value. Can be assigned for each mask
+                separately. Preprocess mask with Gaussian blur with specified
+                standard deviation. Recommended range: 0-64.
+            use_boolean_mask (bool): Turn this off if you want to treat the
+                mask image as nonbinary one. The module will use the last
+                channel of the given image in `masks` as the mask value.
+            do_blend (bool): Blend the generated foreground and the optionally
+                predefined background by smooth boundary obtained from Gaussian
+                blurs of the foreground `masks` with the given `mask_stds`.
+            tile_size (Optional[int]): Tile size of the panorama generation.
+                Works best with the default training size of the Stable-
+                Diffusion model, i.e., 512 or 768 for SD1.5 and 1024 for SDXL.
+            bootstrap_steps (int): Overrides the default value. Bootstrapping
+                stage steps to encourage region separation. Recommended range:
+                1-3.
+            boostrap_mix_steps (float): Overrides the default value.
+                Bootstrapping background is a linear interpolation between
+                background latent and the white image latent. This handle
+                controls the mix ratio. Available range: 0-(number of
+                bootstrapping inference steps). For example, 2.3 means that for
+                the first two steps, white image is used as a bootstrapping
+                background and in the third step, mixture of white (0.3) and
+                registered background (0.7) is used as a bootstrapping
+                background.
+            bootstrap_leak_sensitivity (float): Overrides the default value.
+                Postprocessing at each inference step by masking away the
+                remaining bootstrap backgrounds t Recommended range: 0-1.
+            preprocess_mask_cover_alpha (float): Overrides the default value.
+                Optional preprocessing where each mask covered by other masks
+                is reduced in its alpha value by this specified factor.
+
+        Returns: A PIL.Image image of a panorama (large-size) image.
+        """
+
+        ### Simplest cases
+
+        # prompts is None: return background.
+        # masks is None but prompts is not None: return prompts
+        # masks is not None and prompts is not None: Do SemanticDraw.
+
+        if prompts is None or (isinstance(prompts, (list, tuple, str)) and len(prompts) == 0):
+            if background is None and background_prompt is not None:
+                return sample(background_prompt, background_negative_prompt, height, width, num_inference_steps, guidance_scale)
+            return background
+        elif masks is None or (isinstance(masks, (list, tuple)) and len(masks) == 0):
+            return sample(prompts, negative_prompts, height, width, num_inference_steps, guidance_scale)
+
+
+        ### Prepare generation
+
+        if num_inference_steps is not None:
+            self.prepare_lcm_schedule(list(range(num_inference_steps)), num_inference_steps)
+
+        if guidance_scale is None:
+            guidance_scale = self.default_guidance_scale
+
+
+        ### Prompts & Masks
+
+        # asserts #m > 0 and #p > 0.
+        # #m == #p == #n > 0: We happily generate according to the prompts & masks.
+        # #m != #p: #p should be 1 and we will broadcast text embeds of p through m masks.
+        # #p != #n: #n should be 1 and we will broadcast negative embeds n through p prompts.
+
+        if isinstance(masks, Image.Image):
+            masks = [masks]
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        if isinstance(negative_prompts, str):
+            negative_prompts = [negative_prompts]
+        num_masks = len(masks)
+        num_prompts = len(prompts)
+        num_nprompts = len(negative_prompts)
+        assert num_prompts in (num_masks, 1), \
+            f'The number of prompts {num_prompts} should match the number of masks {num_masks}!'
+        assert num_nprompts in (num_prompts, 1), \
+            f'The number of negative prompts {num_nprompts} should match the number of prompts {num_prompts}!'
+
+        fg_masks, masks_g, std = self.process_mask(
+            masks,
+            mask_strengths,
+            mask_stds,
+            height=height,
+            width=width,
+            use_boolean_mask=use_boolean_mask,
+            timesteps=self.timesteps,
+            preprocess_mask_cover_alpha=preprocess_mask_cover_alpha,
+        )  # (p, t, 1, H, W)
+        bg_masks = (1 - fg_masks.sum(dim=0)).clip_(0, 1)  # (T, 1, h, w)
+        has_background = bg_masks.sum() > 0
+
+        h = (height + self.vae_scale_factor - 1) // self.vae_scale_factor
+        w = (width + self.vae_scale_factor - 1) // self.vae_scale_factor
+
+
+        ### Background
+
+        # background == None && background_prompt == None: Initialize with white background.
+        # background == None && background_prompt != None: Generate background *along with other prompts*.
+        # background != None && background_prompt == None: Retrieve text prompt using BLIP.
+        # background != None && background_prompt != None: Use the given arguments.
+
+        # not has_background: no effect of prompt_strength (the mix ratio between fg prompt & bg prompt)
+        # has_background && prompt_strength != 1: mix only for this case.
+
+        bg_latent = None
+        if has_background:
+            if background is None and background_prompt is not None:
+                fg_masks = torch.cat((bg_masks[None], fg_masks), dim=0)
+                if suffix is not None:
+                    prompts = [p + suffix + background_prompt for p in prompts]
+                prompts = [background_prompt] + prompts
+                negative_prompts = [background_negative_prompt] + negative_prompts
+                has_background = False # Regard that background does not exist.
+            else:
+                if background is None and background_prompt is None:
+                    background = torch.ones(1, 3, height, width, dtype=self.dtype, device=self.device)
+                    background_prompt = 'simple white background image'
+                elif background is not None and background_prompt is None:
+                    background_prompt = self.get_text_prompts(background)
+                if suffix is not None:
+                    prompts = [p + suffix + background_prompt for p in prompts]
+                prompts = [background_prompt] + prompts
+                negative_prompts = [background_negative_prompt] + negative_prompts
+                if isinstance(background, Image.Image):
+                    background = T.ToTensor()(background).to(dtype=self.dtype, device=self.device)[None]
+                background = F.interpolate(background, size=(height, width), mode='bicubic', align_corners=False)
+                bg_latent = self.encode_imgs(background)
+
+        # Bootstrapping stage preparation.
+
+        if bootstrap_steps is None:
+            bootstrap_steps = self.default_bootstrap_steps
+        if boostrap_mix_steps is None:
+            boostrap_mix_steps = self.default_boostrap_mix_steps
+        if bootstrap_leak_sensitivity is None:
+            bootstrap_leak_sensitivity = self.default_bootstrap_leak_sensitivity
+        if bootstrap_steps > 0:
+            height_ = min(height, tile_size)
+            width_ = min(width, tile_size)
+            white = self.get_white_background(height, width) # (1, 4, h, w)
+
+
+        ### Prepare text embeddings (optimized for the minimal encoder batch size)
+
+        uncond_embeds, text_embeds = self.get_text_embeds(prompts, negative_prompts)  # [2 * len(prompts), 77, 768]
+        if has_background:
+            # First channel is background prompt text embeds. Background prompt itself is not used for generation.
+            s = prompt_strengths
+            if prompt_strengths is None:
+                s = self.default_prompt_strength
+            if isinstance(s, (int, float)):
+                s = [s] * num_prompts
+            if isinstance(s, (list, tuple)):
+                assert len(s) == num_prompts, \
+                    f'The number of prompt strengths {len(s)} should match the number of prompts {num_prompts}!'
+                s = torch.as_tensor(s, dtype=self.dtype, device=self.device)
+            s = s[:, None, None]
+
+            be = text_embeds[:1]
+            bu = uncond_embeds[:1]
+            fe = text_embeds[1:]
+            fu = uncond_embeds[1:]
+            if num_prompts > num_nprompts:
+                # # negative prompts = 1; # prompts > 1.
+                assert fu.shape[0] == 1 and fe.shape == num_prompts
+                fu = fu.repeat(num_prompts, 1, 1)
+            text_embeds = torch.lerp(be, fe, s)  # (p, 77, 768)
+            uncond_embeds = torch.lerp(bu, fu, s)  # (n, 77, 768)
+        elif num_prompts > num_nprompts:
+            # # negative prompts = 1; # prompts > 1.
+            assert uncond_embeds.shape[0] == 1 and text_embeds.shape[0] == num_prompts
+            uncond_embeds = uncond_embeds.repeat(num_prompts, 1, 1)
+        assert uncond_embeds.shape[0] == text_embeds.shape[0] == num_prompts
+        if num_masks > num_prompts:
+            assert masks.shape[0] == num_masks and num_prompts == 1
+            text_embeds = text_embeds.repeat(num_masks, 1, 1)
+            uncond_embeds = uncond_embeds.repeat(num_masks, 1, 1)
+        text_embeds = torch.cat([uncond_embeds, text_embeds])
+
+
+        ### Run
+
+        # Latent initialization.
+        if self.timesteps[0] < 999 and has_background:
+            latent = self.scheduler_add_noise(bg_latent, None, 0)
         else:
-            latent = torch.randn((1, self.unet.config.in_channels, self.latent_height, self.latent_width),
-                dtype=self.dtype, device=self.device)  # (1, 4, h, w)
-        latent = torch.cat((latent, self.x_t_latent_buffer), dim=0)  # (t, 4, h, w)
-        self.stock_noise = torch.cat((self.init_noise[:1], self.stock_noise[:-1]), dim=0)  # (t, 4, h, w)
-        if self.cfg_type in ('self', 'initialize'):
-            self.stock_noise_ = self.stock_noise.repeat_interleave(self.num_layers, dim=0)  # (T * p, 77, 768)
+            latent = torch.randn((1, self.unet.config.in_channels, h, w), dtype=self.dtype, device=self.device)
 
-        x_0_pred_batch = self.unet_step(latent)
+        # Tiling (if needed).
+        if height > tile_size or width > tile_size:
+            t = (tile_size + self.vae_scale_factor - 1) // self.vae_scale_factor
+            views, tile_masks = get_panorama_views(h, w, t)
+            tile_masks = tile_masks.to(self.device)
+        else:
+            views = [(0, h, 0, w)]
+            tile_masks = latent.new_ones((1, 1, h, w))
+        value = torch.zeros_like(latent)
+        count_all = torch.zeros_like(latent)
 
-        latent = x_0_pred_batch[-1:]
-        self.x_t_latent_buffer = (
-            self.alpha_prod_t_sqrt[1:] * x_0_pred_batch[:-1]
-            + self.beta_prod_t_sqrt[1:] * self.init_noise[1:]
-        )
+        with torch.autocast('cuda'):
+            for i, t in enumerate(tqdm(self.timesteps)):
+                fg_mask = fg_masks[:, i]
+                bg_mask = bg_masks[i:i + 1]
 
-        # For pipeline flushing.
-        if no_decode:
-            return latent
+                value.zero_()
+                count_all.zero_()
+                for j, (h_start, h_end, w_start, w_end) in enumerate(views):
+                    fg_mask_ = fg_mask[..., h_start:h_end, w_start:w_end]
+                    latent_ = latent[..., h_start:h_end, w_start:w_end].repeat(num_masks, 1, 1, 1)
 
-        imgs = self.decode_latents(latent.half())  # (1, 3, H, W)
-        img = T.ToPILImage()(imgs[0].cpu())
-        return img
+                    # Bootstrap for tight background.
+                    if i < bootstrap_steps:
+                        mix_ratio = min(1, max(0, boostrap_mix_steps - i))
+                        # Treat the first foreground latent as the background latent if one does not exist.
+                        bg_latent_ = bg_latent[..., h_start:h_end, w_start:w_end] if has_background else latent_[:1]
+                        white_ = white[..., h_start:h_end, w_start:w_end]
+                        bg_latent_ = mix_ratio * white_ + (1.0 - mix_ratio) * bg_latent_
+                        bg_latent_ = self.scheduler_add_noise(bg_latent_, None, i)
+                        latent_ = (1.0 - fg_mask_) * bg_latent_ + fg_mask_ * latent_
 
-    def flush(self) -> None:
-        for _ in self.t_list:
-            self(True, True)
-        self.ready_checklist['flushed'] = True
+                        # Centering.
+                        latent_ = shift_to_mask_bbox_center(latent_, fg_mask_, reverse=True)
+
+                    # Perform one step of the reverse diffusion.
+                    noise_pred = self.unet(torch.cat([latent_] * 2), t, encoder_hidden_states=text_embeds)['sample']
+                    noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    latent_ = self.scheduler_step(noise_pred, i, latent_)
+
+                    if i < bootstrap_steps:
+                        # Uncentering.
+                        latent_ = shift_to_mask_bbox_center(latent_, fg_mask_)
+
+                        # Remove leakage (optional).
+                        leak = (latent_ - bg_latent_).pow(2).mean(dim=1, keepdim=True)
+                        leak_sigmoid = torch.sigmoid(leak / bootstrap_leak_sensitivity) * 2 - 1
+                        fg_mask_ = fg_mask_ * leak_sigmoid
+
+                    # Mix the latents.
+                    fg_mask_ = fg_mask_ * tile_masks[:, j:j + 1, h_start:h_end, w_start:w_end]
+                    value[..., h_start:h_end, w_start:w_end] += (fg_mask_ * latent_).sum(dim=0, keepdim=True)
+                    count_all[..., h_start:h_end, w_start:w_end] += fg_mask_.sum(dim=0, keepdim=True)
+
+                latent = torch.where(count_all > 0, value / count_all, value)
+                bg_mask = (1 - count_all).clip_(0, 1)  # (T, 1, h, w)
+                if has_background:
+                    latent = (1 - bg_mask) * latent + bg_mask * bg_latent
+
+                # Noise is added after mixing.
+                if i < len(self.timesteps) - 1:
+                    latent = self.scheduler_add_noise(latent, None, i + 1)
+
+        # Return PIL Image.
+        image = self.decode_latents(latent.to(dtype=self.dtype))[0]
+        if has_background and do_blend:
+            fg_mask = torch.sum(masks_g, dim=0).clip_(0, 1)
+            image = blend(image, background[0], fg_mask)
+        else:
+            image = T.ToPILImage()(image)
+        return image
