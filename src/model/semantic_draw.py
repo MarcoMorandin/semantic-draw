@@ -1285,12 +1285,18 @@ class SemanticDraw(nn.Module):
         # compute the previous noisy sample x_t -> x_t-1
         # No averaging needed! Each pixel is already "pure".
         if idx is None:
-             # Use tensors matching T (batch size)
-             F_theta = (x_t_latent - self.beta_prod_t_sqrt * model_pred) / self.alpha_prod_t_sqrt
-             denoised_batch = self.c_out * F_theta + self.c_skip * x_t_latent
+             # Iterate over batch T to use scheduler correctly
+             denoised_list = []
+             for i in range(model_pred.shape[0]):
+                 t = self.sub_timesteps_tensor[i]
+                 step_out = self.pipe.scheduler.step(model_pred[i:i+1], t, x_t_latent[i:i+1], return_dict=True)
+                 denoised_list.append(step_out.denoised)
+             denoised_batch = torch.cat(denoised_list, dim=0)
         else:
-             F_theta = (x_t_latent - self.beta_prod_t_sqrt[idx] * model_pred) / self.alpha_prod_t_sqrt[idx]
-             denoised_batch = self.c_out[idx] * F_theta + self.c_skip[idx] * x_t_latent
+             # Original logic for idx case (seems unused but keeping consistent)
+             t = self.sub_timesteps_tensor[idx]
+             step_out = self.pipe.scheduler.step(model_pred, t, x_t_latent, return_dict=True)
+             denoised_batch = step_out.denoised
 
 
         # 6. Noise Addition for Stream Batch (Shift happens outside this func usually? No, SemanticDraw pipeline handles shifting?)
