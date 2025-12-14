@@ -1164,10 +1164,27 @@ class SemanticDraw(nn.Module):
              uncond_reshaped = rearrange(uncond_flat, '(t p) l d -> t (p l) d', p=p, t=T_batch)
              cond_reshaped = rearrange(cond_flat, '(t p) l d -> t (p l) d', p=p, t=T_batch)
              
+             # --- Add Background Embedding ---
+             # self.background.embed is simple tuple (cond, uncond) each (1, 77, 768)
+             # We assume they are static across T (unless background prompt changes, but update_background handles it)
+             bg_cond_raw, bg_uncond_raw = self.background.embed
+             
+             # Expand to T
+             bg_cond = bg_cond_raw.repeat(T_batch, 1, 1) # (T, 77, 768)
+             bg_uncond = bg_uncond_raw.repeat(T_batch, 1, 1) # (T, 77, 768)
+             
+             # Concatenate to (T, (p+1)*77, 768)
+             # Note: logic for 'rearrange' below combines p and l.
+             # We need to concat in dimension 1 (sequence length)
+             cond_reshaped = torch.cat([cond_reshaped, bg_cond], dim=1)
+             uncond_reshaped = torch.cat([uncond_reshaped, bg_uncond], dim=1)
+             
+             p_total = p + 1
+
              # Concat for Classifier Free Guidance: [Uncond, Cond] in batch dim?
              # Standard diffusers: cat([uncond, cond]) -> Batch size * 2.
-             # So we want (2*T, p*77, 768)
-             text_embeds = torch.cat([uncond_reshaped, cond_reshaped], dim=0) # (2*T, p*77, 768)
+             # So we want (2*T, p_total*77, 768)
+             text_embeds = torch.cat([uncond_reshaped, cond_reshaped], dim=0) # (2*T, p_total*77, 768)
              
              # Latent input must also be doubled
              x_in = torch.cat([x_t_latent, x_t_latent], dim=0) # (2*T, 4, h, w)
@@ -1175,7 +1192,16 @@ class SemanticDraw(nn.Module):
              
         else:
              cond_flat = self.prompt_embeds
-             text_embeds = rearrange(cond_flat, '(t p) l d -> t (p l) d', p=p, t=T_batch)
+             cond_reshaped = rearrange(cond_flat, '(t p) l d -> t (p l) d', p=p, t=T_batch)
+             
+             # --- Add Background Embedding ---
+             bg_cond_raw, _ = self.background.embed
+             bg_cond = bg_cond_raw.repeat(T_batch, 1, 1)
+             cond_reshaped = torch.cat([cond_reshaped, bg_cond], dim=1)
+             
+             p_total = p + 1
+             
+             text_embeds = cond_reshaped
              x_in = x_t_latent
              t_list = self.sub_timesteps_tensor
 
@@ -1196,10 +1222,16 @@ class SemanticDraw(nn.Module):
         
         # Prepare base masks: rearrange to (T, p, 1, h, w)
         base_masks = rearrange(self.masks, 'p t c h w -> t p c h w')
+        
+        # --- Add Background Mask ---
+        # self.bg_mask is (T, 1, h, w). Need (T, 1, 1, h, w) to match base_masks
+        bg_mask_expanded = self.bg_mask.unsqueeze(1) 
+        base_masks = torch.cat([base_masks, bg_mask_expanded], dim=1) # (T, p+1, 1, h, w)
+        
         if self.guidance_scale > 1.0 and self.cfg_type in ('initialize', 'full'):
              # Duplicate for Uncond (apply same mask to uncond? Or full mask?)
              # Usually we want Negative Prompt to also be localized.
-             base_masks = torch.cat([base_masks, base_masks], dim=0) # (2*T, p, 1, h, w)
+             base_masks = torch.cat([base_masks, base_masks], dim=0) # (2*T, p+1, 1, h, w)
 
         h_latent = x_t_latent.shape[-2]
         w_latent = x_t_latent.shape[-1]
@@ -1210,15 +1242,15 @@ class SemanticDraw(nn.Module):
              num_pixels = h_curr * w_curr
              
              # Downsample masks
-             # Input: (TotalBatch, p, 1, h, w) -> reshape to (TotalBatch*p, 1, h, w) for interpolate
+             # Input: (TotalBatch, p_total, 1, h, w)
              bs_masks = base_masks.shape[0]
              flat_masks = rearrange(base_masks, 'b p c h w -> (b p) c h w')
              
              masks_res = F.interpolate(flat_masks, size=(h_curr, w_curr), mode='nearest')
              
              # Reshape back and Flatten spatial
-             # (TotalBatch, p, 1, h_small, w_small)
-             masks_res = rearrange(masks_res, '(b p) c h w -> b p (c h w)', b=bs_masks, p=p)
+             # (TotalBatch, p_total, 1, h_small, w_small)
+             masks_res = rearrange(masks_res, '(b p) c h w -> b p (c h w)', b=bs_masks, p=p_total)
              
              # Now construct the Attention Bias Matrix (B, Q, K) = (B, H*W, P*77)
              # Start with -inf (masked)
