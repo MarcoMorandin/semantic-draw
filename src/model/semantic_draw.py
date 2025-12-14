@@ -369,6 +369,10 @@ class SemanticDraw(nn.Module):
         Returns:
             A single string of text prompt.
         """
+        if not hasattr(self, 'i2t_model') or self.i2t_model is None:
+            print("[WARN] BLIP-2 model not loaded. Returning empty prompt.")
+            return ""
+
         question = 'Question: What are in the image? Answer:'
         inputs = self.i2t_processor(image, question, return_tensors='pt')
         if hasattr(self.i2t_model, 'device') and self.i2t_model.device.type != 'cpu':
