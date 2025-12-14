@@ -69,6 +69,7 @@ class SemanticDraw(nn.Module):
         prompt_queue_capacity: int = 256,
         mask_type: Literal['discrete', 'semi-continuous', 'continuous'] = 'continuous',
         use_xformers: bool = True,
+        has_i2t: bool = True,
     ) -> None:
         super().__init__()
 
@@ -142,8 +143,11 @@ class SemanticDraw(nn.Module):
         }
 
         # Create model
-        self.i2t_processor = Blip2Processor.from_pretrained('Salesforce/blip2-opt-2.7b')
-        self.i2t_model = Blip2ForConditionalGeneration.from_pretrained('Salesforce/blip2-opt-2.7b')
+        if has_i2t:
+            self.i2t_processor = Blip2Processor.from_pretrained('Salesforce/blip2-opt-2.7b')
+            self.i2t_model = Blip2ForConditionalGeneration.from_pretrained('Salesforce/blip2-opt-2.7b')
+        else:
+            self.i2t_model = None
 
         self.pipe = load_model(model_key, self.sd_version, self.device, self.dtype)
 
