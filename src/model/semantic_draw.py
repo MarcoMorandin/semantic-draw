@@ -369,10 +369,23 @@ class SemanticDraw(nn.Module):
         Returns:
             A single string of text prompt.
         """
+        print("[DEBUG] Entering get_text_prompts")
         question = 'Question: What are in the image? Answer:'
+        print("[DEBUG] Processing image with i2t_processor...")
         inputs = self.i2t_processor(image, question, return_tensors='pt')
+        print(f"[DEBUG] Inputs prepared. Model device: {self.i2t_model.device}, Inputs device: {inputs['input_ids'].device}")
+        
+        # Ensure model and inputs are on the same device (CPU by default unless moved)
+        # If model is on cuda, move inputs.
+        if self.i2t_model.device.type != 'cpu':
+             inputs = {k: v.to(self.i2t_model.device) for k, v in inputs.items()}
+             print(f"[DEBUG] Inputs moved to {self.i2t_model.device}")
+
+        print("[DEBUG] Generating prompt with i2t_model...")
         out = self.i2t_model.generate(**inputs, max_new_tokens=77)
+        print("[DEBUG] Prompt generated. Decoding...")
         prompt = self.i2t_processor.decode(out[0], skip_special_tokens=True).strip()
+        print(f"[DEBUG] Prompt extracted: {prompt}")
         return prompt
 
     @torch.no_grad()
