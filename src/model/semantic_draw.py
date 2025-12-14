@@ -451,11 +451,16 @@ class SemanticDraw(nn.Module):
         prompt: Optional[str] = None,
         negative_prompt: Optional[str] = None,
     ) -> bool:
+        print(f"[DEBUG] update_background called. image present: {image is not None}, prompt: {prompt}", flush=True)
         flag_changed = False
         if image is not None:
+            print("[DEBUG] resizing image...", flush=True)
             image_ = image.resize((self.width, self.height))
+            print("[DEBUG] image resized. getting text prompts...", flush=True)
             prompt = self.get_text_prompts(image_) if prompt is None else prompt
+            print(f"[DEBUG] got text prompt: {prompt}", flush=True)
             negative_prompt = '' if negative_prompt is None else negative_prompt
+            print("[DEBUG] encoding prompt...", flush=True)
             embed = self.pipe.encode_prompt(
                 prompt=[prompt],
                 device=self.device,
@@ -463,6 +468,7 @@ class SemanticDraw(nn.Module):
                 do_classifier_free_guidance=(self.guidance_scale > 1.0),
                 negative_prompt=[negative_prompt],
             )  # ((1, 77, 768): cond, (1, 77, 768): uncond)
+            print("[DEBUG] prompt encoded.", flush=True)
 
             self.state['background'].image = image
             self.state['background'].latent = (
