@@ -208,17 +208,30 @@ class SemanticDraw(nn.Module):
 
         # Set up RCCA Custom Attention Processors
         attn_procs = {}
+        count_rcca = 0
         for name, _ in self.unet.attn_processors.items():
             # Check if it's a cross-attention layer (usually has 'attn2')
             # Assuming standard Stable Diffusion U-Net naming
             if name.endswith("attn2.processor"):
                  attn_procs[name] = RegionConstrainedAttnProcessor()
+                 count_rcca += 1
             else:
                  # Keep default for self-attention
                  attn_procs[name] = self.unet.attn_processors[name]
         
+        print(f"[DEBUG] Found {count_rcca} attn2 layers to replace with RCCA.")
         self.unet.set_attn_processor(attn_procs)
         print(f'[INFO]     RCCA Attention Processors initialized!')
+        
+        # Verify
+        print("[DEBUG] Verifying processors after set:")
+        for name, proc in self.unet.attn_processors.items():
+            if name.endswith("attn2.processor"):
+                if not isinstance(proc, RegionConstrainedAttnProcessor):
+                     print(f"[ERROR] Layer {name} has processor {type(proc)} instead of RegionConstrainedAttnProcessor")
+                else:
+                     # print(f"[DEBUG] Layer {name} is correctly RegionConstrainedAttnProcessor")
+                     pass
 
         self.reset_seed(self.generator, seed)
         self.reset_latent()
