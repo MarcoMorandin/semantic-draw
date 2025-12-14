@@ -150,6 +150,7 @@ class SemanticDraw(nn.Module):
             self.i2t_model = None
 
         self.pipe = load_model(model_key, self.sd_version, self.device, self.dtype)
+        self.pipe.scheduler = get_scheduler(self.pipe)
 
         self.pipe.load_lora_weights(lora_key, weight_name=lora_weight_name, adapter_name='lcm')
         self.pipe.fuse_lora(
