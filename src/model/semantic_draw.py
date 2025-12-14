@@ -1282,7 +1282,15 @@ class SemanticDraw(nn.Module):
         # 5. Denoise Step
         # compute the previous noisy sample x_t -> x_t-1
         # No averaging needed! Each pixel is already "pure".
-        denoised_batch = self.scheduler_step_batch(model_pred, x_t_latent, idx)
+        # compute the previous noisy sample x_t -> x_t-1
+        # No averaging needed! Each pixel is already "pure".
+        if idx is None:
+             # Use tensors matching T (batch size)
+             F_theta = (x_t_latent - self.beta_prod_t_sqrt * model_pred) / self.alpha_prod_t_sqrt
+             denoised_batch = self.c_out * F_theta + self.c_skip * x_t_latent
+        else:
+             F_theta = (x_t_latent - self.beta_prod_t_sqrt[idx] * model_pred) / self.alpha_prod_t_sqrt[idx]
+             denoised_batch = self.c_out[idx] * F_theta + self.c_skip[idx] * x_t_latent
 
 
         # 6. Noise Addition for Stream Batch (Shift happens outside this func usually? No, SemanticDraw pipeline handles shifting?)
