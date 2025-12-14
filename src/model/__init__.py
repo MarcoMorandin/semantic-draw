@@ -19,8 +19,16 @@
 # SOFTWARE.
 
 from .pipeline_semantic_draw import SemanticDrawPipeline
-from .pipeline_semantic_draw_sdxl import SemanticDrawSDXLPipeline
-from .pipeline_semantic_draw_3 import SemanticDraw3Pipeline
 from .semantic_draw import SemanticDraw
-from .semantic_draw_sdxl import SemanticDrawSDXL
-from .semantic_draw_3 import SemanticDraw3
+
+try:
+    from .pipeline_semantic_draw_sdxl import SemanticDrawSDXLPipeline
+    from .semantic_draw_sdxl import SemanticDrawSDXL
+except ImportError:
+    pass
+
+try:
+    from .pipeline_semantic_draw_3 import SemanticDraw3Pipeline
+    from .semantic_draw_3 import SemanticDraw3
+except ImportError:
+    pass

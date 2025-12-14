@@ -32,10 +32,12 @@ from diffusers.models.attention_processor import (
     LoRAXFormersAttnProcessor,
     XFormersAttnProcessor,
 )
-from diffusers.loaders import (
-    StableDiffusionXLLoraLoaderMixin,
-    TextualInversionLoaderMixin,
-)
+from diffusers.loaders import TextualInversionLoaderMixin
+
+try:
+    from diffusers.loaders import StableDiffusionXLLoraLoaderMixin
+except ImportError:
+    class StableDiffusionXLLoraLoaderMixin: pass
 from diffusers.utils import (
     USE_PEFT_BACKEND,
     logging,

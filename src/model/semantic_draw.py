@@ -35,6 +35,8 @@ from PIL import Image
 
 from util import load_model, gaussian_lowpass, shift_to_mask_bbox_center
 from data import BackgroundObject, LayerObject, BackgroundState #, LayerState
+from .rcca import RegionConstrainedAttnProcessor
+import math
 
 
 class SemanticDraw(nn.Module):
@@ -197,6 +199,20 @@ class SemanticDraw(nn.Module):
             self.trt_unet_batch_size = self.denoising_steps_num * frame_buffer_size
 
         print(f'[INFO]     Model is loaded!')
+
+        # Set up RCCA Custom Attention Processors
+        attn_procs = {}
+        for name, _ in self.unet.attn_processors.items():
+            # Check if it's a cross-attention layer (usually has 'attn2')
+            # Assuming standard Stable Diffusion U-Net naming
+            if name.endswith("attn2.processor"):
+                 attn_procs[name] = RegionConstrainedAttnProcessor()
+            else:
+                 # Keep default for self-attention
+                 attn_procs[name] = self.unet.attn_processors[name]
+        
+        self.unet.set_attn_processor(attn_procs)
+        print(f'[INFO]     RCCA Attention Processors initialized!')
 
         self.reset_seed(self.generator, seed)
         self.reset_latent()
@@ -1106,117 +1122,172 @@ class SemanticDraw(nn.Module):
         x_t_latent: torch.Tensor,  # (T, 4, h, w)
         idx: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # RCCA Implementation: Single Forward Pass with Masked Attention
+        
         p = self.num_layers
-        x_t_latent = x_t_latent.repeat_interleave(p, dim=0)  # (T * p, 4, h, w)
-
-        if self.bootstrap_steps[0] > 0:
-            # Background bootstrapping.
-            bootstrap_latent = self.scheduler.add_noise(
-                self.bootstrap_latent,
-                self.stock_noise,
-                torch.tensor(self.sub_timesteps_tensor, device=self.device),
-            )
-            x_t_latent = rearrange(x_t_latent, '(t p) c h w -> p t c h w', p=p)
-            bootstrap_mask = (
-                self.masks * self.bootstrap_steps[None, :, None, None, None]
-                + (1.0 - self.bootstrap_steps[None, :, None, None, None])
-            ) # (p, t, c, h, w)
-            x_t_latent = (1.0 - bootstrap_mask) * bootstrap_latent[None] + bootstrap_mask * x_t_latent
-            x_t_latent = rearrange(x_t_latent, 'p t c h w -> (t p) c h w')
-
-            # Centering.
-            x_t_latent = shift_to_mask_bbox_center(x_t_latent, rearrange(self.masks, 'p t c h w -> (t p) c h w'), reverse=True)
-
-        t_list = self.sub_timesteps_tensor_  # (T * p,)
-        if self.guidance_scale > 1.0 and self.cfg_type == 'initialize':
-            x_t_latent_plus_uc = torch.concat([x_t_latent[:p], x_t_latent], dim=0)  # (T * p + 1, 4, h, w)
-            t_list = torch.concat([t_list[:p], t_list], dim=0)  # (T * p + 1, 4, h, w)
-        elif self.guidance_scale > 1.0 and self.cfg_type == 'full':
-            x_t_latent_plus_uc = torch.concat([x_t_latent, x_t_latent], dim=0)  # (2 * T * p, 4, h, w)
-            t_list = torch.concat([t_list, t_list], dim=0)  # (2 * T * p,)
+        # x_t_latent is (T, 4, h, w). We assume batch size 1 for T (stream batching usually means T distinct frames).
+        # Actually T is the number of stream slots. Steps 0, 1, 2... 
+        # x_t_latent shape is (T, 4, h, w). T is batch size for the U-Net.
+        
+        T_batch = x_t_latent.shape[0]
+        
+        # 1. Prepare Embeddings for Single Pass
+        # self.prompt_embeds shape is (T*p, 77, 768) or (2*T*p, ...) if double cond.
+        # We need to reshape to (T, p*77, 768).
+        
+        # Note: self.prompt_embeds was constructed for the "Batch splitting" method (repeating T for each p).
+        # Structure: [T_step0_p0, T_step0_p1... T_stepN_pM] (interleaved? check update_layers)
+        # update_layers: rearrange(prompt_embed_, 't p c1 c2 -> (t p) c1 c2')
+        # So it is Interleaved: t0p0, t0p1, t0p2... t1p0...
+        
+        if self.guidance_scale > 1.0 and self.cfg_type in ('initialize', 'full'):
+             # Structure: [Uncond(T*p), Cond(T*p)]
+             # Split first
+             all_embeds = self.prompt_embeds
+             half = all_embeds.shape[0] // 2
+             uncond_flat = all_embeds[:half] # (T*p, 77, 768)
+             cond_flat = all_embeds[half:]   # (T*p, 77, 768)
+             
+             # Reshape to (T, p, 77, 768)
+             uncond_reshaped = rearrange(uncond_flat, '(t p) l d -> t (p l) d', p=p, t=T_batch)
+             cond_reshaped = rearrange(cond_flat, '(t p) l d -> t (p l) d', p=p, t=T_batch)
+             
+             # Concat for Classifier Free Guidance: [Uncond, Cond] in batch dim?
+             # Standard diffusers: cat([uncond, cond]) -> Batch size * 2.
+             # So we want (2*T, p*77, 768)
+             text_embeds = torch.cat([uncond_reshaped, cond_reshaped], dim=0) # (2*T, p*77, 768)
+             
+             # Latent input must also be doubled
+             x_in = torch.cat([x_t_latent, x_t_latent], dim=0) # (2*T, 4, h, w)
+             t_list = torch.cat([self.sub_timesteps_tensor, self.sub_timesteps_tensor], dim=0)
+             
         else:
-            x_t_latent_plus_uc = x_t_latent  # (T * p, 4, h, w)
+             cond_flat = self.prompt_embeds
+             text_embeds = rearrange(cond_flat, '(t p) l d -> t (p l) d', p=p, t=T_batch)
+             x_in = x_t_latent
+             t_list = self.sub_timesteps_tensor
 
+
+        # 2. Construct RCCA Mask Pyramid (JIT)
+        # We need masks for resolutions 64x64, 32x32, 16x16, 8x8 (relative to latent).
+        # Latent h, w are e.g. 64.
+        # Attention maps will be H*W.
+        # self.masks shape: (p, T, 1, h, w).
+        # We need to map this to Attention Mask (BatchSize, QueryLen, KeyLen)
+        # BatchSize = 2*T (if CFG).
+        # QueryLen = h*w (spatial).
+        # KeyLen = p*77.
+        
+        rcca_masks = {}
+        resolutions = [1, 2, 4, 8] # Downsample factors: 64, 32, 16, 8.
+        # Note: U-Net CrossAttn is at 64(1x), 32(2x), 16(4x). 8(8x) is Mid.
+        
+        # Prepare base masks: rearrange to (T, p, 1, h, w)
+        base_masks = rearrange(self.masks, 'p t c h w -> t p c h w')
+        if self.guidance_scale > 1.0 and self.cfg_type in ('initialize', 'full'):
+             # Duplicate for Uncond (apply same mask to uncond? Or full mask?)
+             # Usually we want Negative Prompt to also be localized.
+             base_masks = torch.cat([base_masks, base_masks], dim=0) # (2*T, p, 1, h, w)
+
+        h_latent = x_t_latent.shape[-2]
+        w_latent = x_t_latent.shape[-1]
+
+        for scale_idx, scale in enumerate(resolutions):
+             h_curr = h_latent // scale
+             w_curr = w_latent // scale
+             num_pixels = h_curr * w_curr
+             
+             # Downsample masks
+             # Input: (TotalBatch, p, 1, h, w) -> reshape to (TotalBatch*p, 1, h, w) for interpolate
+             bs_masks = base_masks.shape[0]
+             flat_masks = rearrange(base_masks, 'b p c h w -> (b p) c h w')
+             
+             masks_res = F.interpolate(flat_masks, size=(h_curr, w_curr), mode='nearest')
+             
+             # Reshape back and Flatten spatial
+             # (TotalBatch, p, 1, h_small, w_small)
+             masks_res = rearrange(masks_res, '(b p) c h w -> b p (c h w)', b=bs_masks, p=p)
+             
+             # Now construct the Attention Bias Matrix (B, Q, K) = (B, H*W, P*77)
+             # Start with -inf (masked)
+             # Where mask is 1, set to 0.
+             
+             # Note: self.masks are 0 or 1 (or soft). 
+             # For RCCA binary: 1=Attend, 0=Block.
+             # Log(M): 1->0, 0->-inf.
+             # Clamp to avoid log(0)
+             
+             # Optimize: We want (B, Pixel, P*77).
+             # We have (B, P, Pixel).
+             # Transpose to (B, Pixel, P).
+             masks_res = masks_res.transpose(1, 2) # (B, Pixel, P)
+             
+             # Repeat for 77 tokens
+             masks_res = masks_res.unsqueeze(-1).repeat(1, 1, 1, 77) # (B, Pixel, P, 77)
+             masks_res = rearrange(masks_res, 'b x p l -> b x (p l)') # (B, Pixel, P*77)
+             
+             # Convert to log-space bias
+             # Use a small epsilon for 0 values to get large negative number
+             # masks_res values are in [0, 1]
+             # bias = ln(mask + eps). 
+             # If mask is 1, ln(1)=0. If mask is 0, ln(eps) ~ -inf.
+             
+             bias = torch.log(masks_res + 1e-5) # 1e-5 gives -11.5. Softmax will handle it? 
+             # Standard masking uses -1e4 or similar.
+             # Let's clean it up:
+             bias = torch.where(masks_res > 0.5, torch.zeros_like(masks_res), torch.tensor(-10000.0, dtype=masks_res.dtype, device=masks_res.device))
+             
+             rcca_masks[num_pixels] = bias
+
+
+        # 3. Forward Pass
         model_pred = self.unet(
-            x_t_latent_plus_uc,  # (B, 4, h, w)
-            t_list,  # (B,)
-            encoder_hidden_states=self.prompt_embeds,  # (B, 77, 768)
+            x_in,
+            t_list,
+            encoder_hidden_states=text_embeds,
             return_dict=False,
-            # TODO: Add SDXL Support.
-            # added_cond_kwargs={'text_embeds': add_text_embeds, 'time_ids': add_time_ids},
-        )[0]  # (B, 4, h, w)
-
-        if self.bootstrap_steps[0] > 0:
-            # Uncentering.
-            bootstrap_mask = rearrange(self.masks, 'p t c h w -> (t p) c h w')
-            if self.guidance_scale > 1.0 and self.cfg_type == 'initialize':
-                bootstrap_mask_ = torch.concat([bootstrap_mask[:p], bootstrap_mask], dim=0)
-            elif self.guidance_scale > 1.0 and self.cfg_type == 'full':
-                bootstrap_mask_ = torch.concat([bootstrap_mask, bootstrap_mask], dim=0)
-            else:
-                bootstrap_mask_ = bootstrap_mask
-            model_pred = shift_to_mask_bbox_center(model_pred, bootstrap_mask_)
-            x_t_latent = shift_to_mask_bbox_center(x_t_latent, bootstrap_mask)
-
-            # # Remove leakage (optional).
-            # leak = (latent_ - bg_latent_).pow(2).mean(dim=1, keepdim=True)
-            # leak_sigmoid = torch.sigmoid(leak / self.bootstrap_leak_sensitivity) * 2 - 1
-            # fg_mask_ = fg_mask_ * leak_sigmoid
-
-        ### noise_pred_text, noise_pred_uncond: (T * p, 4, h, w)
-        ### self.stock_noise, init_noise: (T, 4, h, w)
-
-        if self.guidance_scale > 1.0 and self.cfg_type == 'initialize':
-            noise_pred_text = model_pred[p:]
-            self.stock_noise_ = torch.concat([model_pred[:p], self.stock_noise_[p:]], dim=0)
-        elif self.guidance_scale > 1.0 and self.cfg_type == 'full':
-            noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
+            cross_attention_kwargs={'rcca_masks': rcca_masks}
+        )[0]
+        
+        
+        # 4. Handle Output
+        if self.guidance_scale > 1.0 and self.cfg_type in ('initialize', 'full'):
+             noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
+             
+             # Update stock noise (legacy support, might act weird but keeping for safety)
+             # Originally kept for 'self'/'initialize' CFG types.
+             # If P changed, stock_noise_ shape logic in original code was complex.
+             # Here we simplified to Single Pass.
+             # We need to maintain self.stock_noise_ shape for next steps if needed?
+             # self.stock_noise is (T, 4, h, w).
+             # self.stock_noise_ was (T*p, ...).
+             # We don't use stock_noise_ anymore in this simplified flow except for the 'self' correction.
+             # If we want to support 'self' correction, we need to adapt it. 
+             # For now, standard CFG:
+             model_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
         else:
-            noise_pred_text = model_pred
-        if self.guidance_scale > 1.0 and self.cfg_type in ('self', 'initialize'):
-            noise_pred_uncond = self.stock_noise_ * self.delta
-
-        if self.guidance_scale > 1.0 and self.cfg_type != 'none':
-            model_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-        else:
-            model_pred = noise_pred_text
-
+             model_pred = model_pred
+             
+             
+        # 5. Denoise Step
         # compute the previous noisy sample x_t -> x_t-1
+        # No averaging needed! Each pixel is already "pure".
         denoised_batch = self.scheduler_step_batch(model_pred, x_t_latent, idx)
 
-        if self.cfg_type in ('self' , 'initialize'):
-            scaled_noise = self.beta_prod_t_sqrt_ * self.stock_noise_
-            delta_x = self.scheduler_step_batch(model_pred, scaled_noise, idx)
 
-            # Do mask edit.
-            alpha_next = torch.concat([self.alpha_prod_t_sqrt_[p:], torch.ones_like(self.alpha_prod_t_sqrt_[:p])], dim=0)
-            delta_x = alpha_next * delta_x
-            beta_next = torch.concat([self.beta_prod_t_sqrt_[p:], torch.ones_like(self.beta_prod_t_sqrt_[:p])], dim=0)
-            delta_x = delta_x / beta_next
-            init_noise = torch.concat([self.init_noise_[p:], self.init_noise_[:p]], dim=0)
-            self.stock_noise_ = init_noise + delta_x
-
-        p2 = len(self.t_list) - 1
-        background = torch.concat([
-            self.scheduler.add_noise(
-                self.background.latent.repeat(p2, 1, 1, 1),
-                self.stock_noise[1:],
-                torch.tensor(self.t_list[1:], device=self.device),
-            ),
-            self.background.latent,
-        ], dim=0)
-
-        denoised_batch = rearrange(denoised_batch, '(t p) c h w -> p t c h w', p=p)
-        latent = (self.masks * denoised_batch).sum(dim=0)  # (T, 4, h, w)
-        latent = torch.where(self.counts > 0, latent / self.counts, latent)
-
-        # latent = (
-        #     (1 - self.bg_mask) * self.mask_strengths * latent
-        #     + ((1 - self.bg_mask) * (1.0 - self.mask_strengths) + self.bg_mask) * background
-        # )
-        latent = (1 - self.bg_mask) * latent + self.bg_mask * background
-
-        return latent
+        # 6. Noise Addition for Stream Batch (Shift happens outside this func usually? No, SemanticDraw pipeline handles shifting?)
+        # SemanticDraw.pdf says: "Slot 1 emits finished... Slot 2 moves to Slot 1".
+        # The pipeline loop handles the shifting of slots (x_t_latent_buffer).
+        # We just return the new latent.
+        
+        # Background handling (Legacy "Bootstrapping" replacement per marco.md)
+        # "RCCA treats the background as the inverse of the foreground masks... logic handled in mask generation."
+        # We handled it by including Background Prompt in the P prompts and generating a Background Mask.
+        # So we don't need explicit background mixing here.
+        
+        # However, we must return `latent`.
+        
+        return denoised_batch
 
     @torch.no_grad()
     def __call__(

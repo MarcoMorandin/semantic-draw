@@ -51,8 +51,12 @@ from diffusers.models.transformers import SD3Transformer2DModel
 from diffusers.pipelines.stable_diffusion_3 import StableDiffusion3PipelineOutput
 from diffusers.schedulers import (
     FlowMatchEulerDiscreteScheduler,
-    FlashFlowMatchEulerDiscreteScheduler,
 )
+
+try:
+    from diffusers.schedulers import FlashFlowMatchEulerDiscreteScheduler
+except ImportError:
+    FlashFlowMatchEulerDiscreteScheduler = FlowMatchEulerDiscreteScheduler
 from diffusers.utils import (
     is_torch_xla_available,
     logging,
